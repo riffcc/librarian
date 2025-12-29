@@ -1,0 +1,265 @@
+//! Job CRDT handlers.
+
+use std::sync::Arc;
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Json,
+};
+use citadel_crdt::ContentId;
+use serde::{Deserialize, Serialize};
+
+use crate::api::ApiState;
+use crate::crdt::{Job, JobTarget, JobType};
+
+/// Job response (serializable).
+#[derive(Serialize)]
+pub struct JobResponse {
+    /// Job ID (hex-encoded).
+    pub id: String,
+
+    /// Job type.
+    pub job_type: String,
+
+    /// Job target.
+    pub target: String,
+
+    /// Current status.
+    pub status: String,
+
+    /// Creation timestamp.
+    pub created_at: u64,
+
+    /// Number of claims.
+    pub claim_count: usize,
+
+    /// Assigned executor (if any).
+    pub executor: Option<String>,
+
+    /// Result (if completed).
+    pub result: Option<serde_json::Value>,
+}
+
+impl From<&Job> for JobResponse {
+    fn from(job: &Job) -> Self {
+        let job_type = match &job.job_type {
+            JobType::Audit => "audit",
+            JobType::Transcode => "transcode",
+            JobType::Migrate => "migrate",
+            JobType::Import => "import",
+        };
+
+        let target = match &job.target {
+            JobTarget::Release(id) => format!("release:{}", id),
+            JobTarget::Category(cat) => format!("category:{}", cat),
+            JobTarget::All => "all".to_string(),
+            JobTarget::ArchiveOrgItem(id) => format!("archive.org:{}", id),
+        };
+
+        let status = format!("{:?}", job.status);
+
+        let executor = job
+            .executor()
+            .map(|id| hex::encode(id.to_be_bytes())[..16].to_string());
+
+        let result = job.result.as_ref().map(|r| {
+            serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
+        });
+
+        JobResponse {
+            id: hex::encode(job.id.as_bytes()),
+            job_type: job_type.to_string(),
+            target,
+            status,
+            created_at: job.created_at,
+            claim_count: job.claims.len(),
+            executor,
+            result,
+        }
+    }
+}
+
+/// List all jobs.
+pub async fn list_jobs(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<Vec<JobResponse>>, (StatusCode, String)> {
+    let node = state.node.read().await;
+
+    let jobs = node
+        .list_jobs()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let responses: Vec<JobResponse> = jobs.iter().map(JobResponse::from).collect();
+
+    Ok(Json(responses))
+}
+
+/// Get a specific job.
+pub async fn get_job(
+    State(state): State<Arc<ApiState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobResponse>, (StatusCode, String)> {
+    let node = state.node.read().await;
+
+    // Parse hex job ID
+    let id_bytes = hex::decode(&job_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID format".to_string()))?;
+
+    if id_bytes.len() != 32 {
+        return Err((StatusCode::BAD_REQUEST, "Job ID must be 32 bytes".to_string()));
+    }
+
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&id_bytes);
+    let content_id = ContentId::from_bytes(bytes);
+
+    let job = node
+        .get_job(&content_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?;
+
+    Ok(Json(JobResponse::from(&job)))
+}
+
+/// Create job request.
+#[derive(Deserialize)]
+pub struct CreateJobRequest {
+    /// Job type: "audit", "transcode", "migrate", "import".
+    pub job_type: String,
+
+    /// Target: "all", "release:<id>", "category:<name>", "archive.org:<id>".
+    pub target: String,
+
+    /// Pre-authorized public key for Archivist uploads.
+    /// Format: "ed25519p/{hex}" as used by Citadel/Flagship.
+    pub pubkey: Option<String>,
+}
+
+/// Start job request (optional pubkey for authorization).
+#[derive(Deserialize, Default)]
+pub struct StartJobRequest {
+    /// Pre-authorized public key for Archivist uploads.
+    /// If provided, updates the job's auth before starting.
+    pub pubkey: Option<String>,
+}
+
+/// Start/retry a pending job.
+pub async fn start_job(
+    State(state): State<Arc<ApiState>>,
+    Path(job_id): Path<String>,
+    body: Option<Json<StartJobRequest>>,
+) -> Result<Json<JobResponse>, (StatusCode, String)> {
+    // Parse hex job ID
+    let id_bytes = hex::decode(&job_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID format".to_string()))?;
+
+    if id_bytes.len() != 32 {
+        return Err((StatusCode::BAD_REQUEST, "Job ID must be 32 bytes".to_string()));
+    }
+
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&id_bytes);
+    let content_id = ContentId::from_bytes(bytes);
+
+    // Get job, optionally update auth pubkey
+    let job = {
+        let request = body.map(|b| b.0).unwrap_or_default();
+
+        if let Some(pubkey) = request.pubkey {
+            // Update auth pubkey before starting
+            let mut node = state.node.write().await;
+            node.update_job_auth(&content_id, pubkey)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        } else {
+            let node = state.node.read().await;
+            node.get_job(&content_id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?
+        }
+    };
+
+    // Notify worker to execute (event-driven)
+    state.notify_job(content_id).await;
+
+    Ok(Json(JobResponse::from(&job)))
+}
+
+/// Cancel/stop a job (marks as failed).
+pub async fn stop_job(
+    State(state): State<Arc<ApiState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobResponse>, (StatusCode, String)> {
+    use crate::crdt::JobResult;
+
+    // Parse hex job ID
+    let id_bytes = hex::decode(&job_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID format".to_string()))?;
+
+    if id_bytes.len() != 32 {
+        return Err((StatusCode::BAD_REQUEST, "Job ID must be 32 bytes".to_string()));
+    }
+
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&id_bytes);
+    let content_id = ContentId::from_bytes(bytes);
+
+    // Complete job with cancellation error
+    let job = {
+        let mut node = state.node.write().await;
+        node.complete_job(&content_id, JobResult::Error("Cancelled by user".to_string()))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        node.get_job(&content_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?
+    };
+
+    Ok(Json(JobResponse::from(&job)))
+}
+
+/// Create a new job.
+pub async fn create_job(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<CreateJobRequest>,
+) -> Result<Json<JobResponse>, (StatusCode, String)> {
+    let job_type = match request.job_type.as_str() {
+        "audit" => JobType::Audit,
+        "transcode" => JobType::Transcode,
+        "migrate" => JobType::Migrate,
+        "import" => JobType::Import,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid job type: {}", request.job_type),
+            ))
+        }
+    };
+
+    let target = if request.target == "all" {
+        JobTarget::All
+    } else if let Some(id) = request.target.strip_prefix("release:") {
+        JobTarget::Release(id.to_string())
+    } else if let Some(cat) = request.target.strip_prefix("category:") {
+        JobTarget::Category(cat.to_string())
+    } else if let Some(id) = request.target.strip_prefix("archive.org:") {
+        JobTarget::ArchiveOrgItem(id.to_string())
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid target format: {}", request.target),
+        ));
+    };
+
+    let job = {
+        let mut node = state.node.write().await;
+        node.create_job_with_auth(job_type, target, request.pubkey)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    // Notify worker immediately (event-driven, no polling)
+    state.notify_job(job.id.clone()).await;
+
+    Ok(Json(JobResponse::from(&job)))
+}
