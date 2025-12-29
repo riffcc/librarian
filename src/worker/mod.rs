@@ -4,8 +4,13 @@
 //! When a job is created, the API sends a notification and the worker
 //! wakes immediately to execute it.
 //!
+//! Jobs run in PARALLEL up to the configured concurrency limit.
+//! Each job is spawned as a separate task, with a semaphore controlling
+//! max concurrent executions.
+//!
 //! This is the correct pattern:
-//! - Job created → notification sent → worker wakes → job executes
+//! - Job created → notification sent → worker wakes → job spawned
+//! - Multiple jobs execute concurrently (up to max_concurrent)
 //! - Zero latency, zero wasted CPU cycles
 
 pub mod buffer;
@@ -14,7 +19,7 @@ pub mod source;
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::api::{ApiState, JobNotification};
@@ -60,53 +65,75 @@ impl std::fmt::Debug for WorkerConfig {
 /// Event-driven job worker.
 ///
 /// Waits on a channel for job notifications. When notified:
-/// 1. Claims the job
-/// 2. Executes based on job type
-/// 3. Completes the job with result
+/// 1. Spawns a task to claim and execute the job
+/// 2. Jobs run in parallel up to max_concurrent limit
+/// 3. Semaphore controls concurrency
 ///
-/// NO POLLING. NO SLEEPS. Pure event-driven.
+/// NO POLLING. NO SLEEPS. Pure event-driven with parallel execution.
 pub struct JobWorker {
     state: Arc<ApiState>,
     config: WorkerConfig,
     /// Shared buffer pool for all downloads
     buffer_pool: Arc<BufferPool>,
+    /// Semaphore to limit concurrent job executions
+    concurrency: Arc<Semaphore>,
 }
 
 impl JobWorker {
     /// Create a new job worker.
     pub fn new(state: Arc<ApiState>, config: WorkerConfig) -> Self {
+        let max_concurrent = config.buffer.max_concurrent;
         let buffer_pool = BufferPool::new(config.buffer.clone());
-        Self { state, config, buffer_pool }
+        let concurrency = Arc::new(Semaphore::new(max_concurrent));
+        Self { state, config, buffer_pool, concurrency }
     }
 
     /// Run the worker - waits on channel for job notifications.
     ///
-    /// This is the correct event-driven pattern:
-    /// - Blocks on recv() until a job notification arrives
-    /// - Wakes immediately when job is created
-    /// - No polling interval, no sleep
-    pub async fn run(&self, mut job_rx: mpsc::Receiver<JobNotification>) {
-        info!("Job worker started (event-driven, waiting on channel)");
+    /// Jobs are spawned as separate tasks and run in PARALLEL.
+    /// A semaphore limits concurrent executions to max_concurrent.
+    pub async fn run(self: Arc<Self>, mut job_rx: mpsc::Receiver<JobNotification>) {
+        info!(
+            max_concurrent = self.config.buffer.max_concurrent,
+            "Job worker started (parallel execution enabled)"
+        );
 
         // Wait for job notifications - blocks until message arrives
         while let Some(notification) = job_rx.recv().await {
             let job_id = notification.job_id;
             let job_id_hex = hex::encode(job_id.as_bytes());
 
-            debug!(job_id = %job_id_hex, "Received job notification");
+            debug!(job_id = %job_id_hex, "Received job notification, spawning task");
 
-            // Try to claim and execute the job
-            if let Err(e) = self.try_execute_job(&job_id).await {
-                error!(job_id = %job_id_hex, error = %e, "Failed to execute job");
-            }
+            // Clone self for the spawned task
+            let worker = Arc::clone(&self);
+
+            // Spawn job execution as a separate task
+            // The semaphore inside try_execute_job limits concurrency
+            tokio::spawn(async move {
+                if let Err(e) = worker.try_execute_job(&job_id).await {
+                    error!(job_id = %job_id_hex, error = %e, "Failed to execute job");
+                }
+            });
         }
 
         info!("Job worker shutting down (channel closed)");
     }
 
     /// Try to claim and execute a job.
+    /// Acquires a permit from the concurrency semaphore before executing.
     async fn try_execute_job(&self, job_id: &citadel_crdt::ContentId) -> anyhow::Result<()> {
         let job_id_hex = hex::encode(job_id.as_bytes());
+
+        // Acquire concurrency permit - waits if at max concurrent jobs
+        let _permit = self.concurrency.acquire().await
+            .map_err(|_| anyhow::anyhow!("Concurrency semaphore closed"))?;
+
+        debug!(
+            job_id = %job_id_hex,
+            active_jobs = self.config.buffer.max_concurrent - self.concurrency.available_permits(),
+            "Acquired execution permit"
+        );
 
         // Claim and start the job
         let job = {
@@ -281,7 +308,7 @@ pub fn spawn_worker(
     config: WorkerConfig,
     job_rx: mpsc::Receiver<JobNotification>,
 ) -> tokio::task::JoinHandle<()> {
-    let worker = JobWorker::new(state, config);
+    let worker = Arc::new(JobWorker::new(state, config));
     tokio::spawn(async move {
         worker.run(job_rx).await;
     })
