@@ -106,6 +106,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/jobs/:id", get(handlers::jobs::get_job))
         .route("/api/v1/jobs/:id/start", post(handlers::jobs::start_job))
         .route("/api/v1/jobs/:id/stop", delete(handlers::jobs::stop_job))
+        .route("/api/v1/jobs/:id/retry", post(handlers::jobs::retry_job))
         // Imports (stub for now)
         .route(
             "/api/v1/imports",

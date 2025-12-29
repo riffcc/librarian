@@ -1639,6 +1639,7 @@ dependencies = [
  "axum",
  "bincode",
  "blake3",
+ "bytes",
  "chrono",
  "citadel-crdt",
  "citadel-docs",

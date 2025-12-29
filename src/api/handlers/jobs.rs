@@ -39,6 +39,9 @@ pub struct JobResponse {
 
     /// Result (if completed).
     pub result: Option<serde_json::Value>,
+
+    /// Retry count (0 = original attempt).
+    pub retry_count: u64,
 }
 
 impl From<&Job> for JobResponse {
@@ -78,6 +81,7 @@ impl From<&Job> for JobResponse {
             claim_count: job.claims.len(),
             executor,
             result,
+            retry_count: job.retry_count,
         }
     }
 }
@@ -217,6 +221,39 @@ pub async fn stop_job(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?
     };
+
+    Ok(Json(JobResponse::from(&job)))
+}
+
+/// Retry a failed or completed job.
+pub async fn retry_job(
+    State(state): State<Arc<ApiState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobResponse>, (StatusCode, String)> {
+    // Parse hex job ID
+    let id_bytes = hex::decode(&job_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID format".to_string()))?;
+
+    if id_bytes.len() != 32 {
+        return Err((StatusCode::BAD_REQUEST, "Job ID must be 32 bytes".to_string()));
+    }
+
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&id_bytes);
+    let content_id = ContentId::from_bytes(bytes);
+
+    // Retry the job and claim it for this node
+    let job = {
+        let mut node = state.node.write().await;
+        node.retry_job(&content_id)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        // Claim the job so this node becomes the executor
+        node.claim_job(&content_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    // Notify worker to pick up the retried job
+    state.notify_job(content_id).await;
 
     Ok(Json(JobResponse::from(&job)))
 }

@@ -40,6 +40,9 @@ pub enum NodeError {
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] bincode::Error),
+
+    #[error("Invalid job state: {0}")]
+    InvalidJobState(String),
 }
 
 pub type Result<T> = std::result::Result<T, NodeError>;
@@ -269,6 +272,31 @@ impl LibrarianNode {
         }
 
         debug!(job_id = %id, status = ?job.status, "Completed job");
+
+        Ok(job)
+    }
+
+    /// Retry a failed or completed job.
+    /// Increments retry_count, resets status to Pending, clears claims and result.
+    pub fn retry_job(&mut self, id: &ContentId) -> Result<Job> {
+        let mut job = self.store.get::<Job>(id)?
+            .ok_or_else(|| NodeError::JobNotFound(id.clone()))?;
+
+        if !job.can_retry() {
+            return Err(NodeError::InvalidJobState(format!(
+                "Job {} is {:?}, cannot retry (must be Failed or Completed)",
+                id, job.status
+            )));
+        }
+
+        job.retry();
+        self.store.put(&job)?;
+
+        info!(
+            job_id = %id,
+            retry_count = job.retry_count,
+            "Retried job - reset to Pending"
+        );
 
         Ok(job)
     }

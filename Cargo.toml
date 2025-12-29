@@ -49,6 +49,10 @@ governor = { version = "0.6", features = ["std", "jitter"] }
 # URL encoding
 urlencoding = "2"
 
+# Transfer buffer
+bytes = "1"
+tempfile = "3"
+
 # Utilities
 anyhow = "1"
 thiserror = "2"
@@ -64,7 +68,6 @@ toml = "0.8"
 hex = "0.4"
 
 [dev-dependencies]
-tempfile = "3"
 
 [[bin]]
 name = "librarian"

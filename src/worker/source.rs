@@ -3,20 +3,22 @@
 //! Downloads content from URLs, IPFS gateways, or Archivist and re-uploads
 //! to the target Archivist instance. Supports single files and directories.
 
+use std::sync::Arc;
+
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::auth::AuthCredentials;
 use crate::crdt::JobResult;
+use super::buffer::BufferPool;
 
 /// Default IPFS gateway for CID resolution.
 pub const DEFAULT_IPFS_GATEWAY: &str = "https://cdn.riff.cc/ipfs/";
 
 /// Default Archivist gateway for CID resolution.
 pub const DEFAULT_ARCHIVIST_GATEWAY: &str = "https://archivist.riff.cc/api/archivist/v1/data/";
-
-/// Maximum size for in-memory download (10 GiB).
-pub const MAX_IN_MEMORY_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 
 /// File entry for directory manifest.
 #[derive(Debug, Serialize)]
@@ -142,14 +144,16 @@ fn format_speed(bytes_per_sec: f64) -> String {
 /// * `archivist_url` - Base URL of target Archivist API
 /// * `source` - Source URL or CID
 /// * `gateway` - Optional gateway override for CID resolution
-/// * `auth_pubkey` - Optional pre-authorized public key for Archivist uploads
+/// * `auth` - Optional authentication credentials for Archivist uploads
+/// * `buffer_pool` - Shared buffer pool for downloads
 /// * `on_progress` - Callback for progress updates (progress 0-1, message, speed)
 pub async fn execute_source_import<F>(
     client: &Client,
     archivist_url: &str,
     source: &str,
     gateway: Option<&str>,
-    auth_pubkey: Option<&str>,
+    auth: Option<&AuthCredentials>,
+    buffer_pool: &Arc<BufferPool>,
     mut on_progress: F,
 ) -> anyhow::Result<JobResult>
 where
@@ -182,7 +186,8 @@ where
             archivist_url,
             source,
             gateway,
-            auth_pubkey,
+            auth,
+            buffer_pool,
             &mut on_progress,
         )
         .await?
@@ -218,16 +223,9 @@ where
 
     if let Some(len) = content_length {
         info!(size = %format_bytes(len), "Content size detected");
-        if len > MAX_IN_MEMORY_SIZE {
-            return Ok(JobResult::Error(format!(
-                "Content too large for in-memory import: {} (max {})",
-                format_bytes(len),
-                format_bytes(MAX_IN_MEMORY_SIZE)
-            )));
-        }
     }
 
-    // Download content
+    // Download content using buffer pool
     let start_time = std::time::Instant::now();
     let response = client.get(&fetch_url).send().await?;
 
@@ -240,8 +238,34 @@ where
 
     on_progress(0.1, Some("Downloading".to_string()), None);
 
-    let bytes = response.bytes().await?;
-    let size = bytes.len() as u64;
+    // Acquire buffer slot from pool (waits if pool is at capacity)
+    let mut slot = buffer_pool.acquire().await;
+
+    // Stream download into buffer (spills to temp file for large files)
+    let mut stream = response.bytes_stream();
+    let mut download_failed = false;
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(source = %source, error = %e, "Download error");
+                download_failed = true;
+                break;
+            }
+        };
+        if let Err(e) = slot.write_chunk(&chunk) {
+            warn!(source = %source, error = %e, "Buffer write error");
+            download_failed = true;
+            break;
+        }
+    }
+
+    if download_failed {
+        return Ok(JobResult::Error("Download failed".to_string()));
+    }
+
+    let size = slot.size();
     let download_duration = start_time.elapsed().as_secs_f64();
     let download_speed = if download_duration > 0.0 {
         size as f64 / download_duration
@@ -252,6 +276,9 @@ where
     info!(
         size = %format_bytes(size),
         speed = %format_speed(download_speed),
+        storage = slot.storage_type(),
+        pool_memory_mb = buffer_pool.memory_used() / 1024 / 1024,
+        pool_disk_mb = buffer_pool.disk_used() / 1024 / 1024,
         "Download complete"
     );
 
@@ -261,8 +288,15 @@ where
         Some(format_speed(download_speed)),
     );
 
-    // Upload to Archivist
+    // Upload to Archivist - read buffer into bytes
     on_progress(0.6, Some("Uploading to Archivist".to_string()), None);
+
+    let bytes = match slot.into_bytes() {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(JobResult::Error(format!("Failed to read buffer: {}", e)));
+        }
+    };
 
     let upload_url = format!("{}/api/archivist/v1/data", archivist_url);
     let upload_start = std::time::Instant::now();
@@ -273,18 +307,37 @@ where
         request = request.header("Content-Type", ct);
     }
 
-    if let Some(pubkey) = auth_pubkey {
-        request = request.header("X-Pubkey", pubkey);
+    // Add auth headers for upload permission
+    if let Some(creds) = auth {
+        request = request
+            .header("X-Pubkey", &creds.pubkey)
+            .header("X-Timestamp", creds.timestamp.to_string())
+            .header("X-Signature", &creds.signature);
     }
 
-    let upload_response = request.send().await?;
+    let upload_response = match request.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let error_msg = if e.is_connect() {
+                format!("Connection failed - Archivist may be down: {}", e)
+            } else if e.is_timeout() {
+                format!("Request timed out: {}", e)
+            } else {
+                format!("Request failed: {}", e)
+            };
+            return Ok(JobResult::Error(format!("Failed to upload to Archivist: {}", error_msg)));
+        }
+    };
 
     if !upload_response.status().is_success() {
-        let error = upload_response.text().await?;
-        return Ok(JobResult::Error(format!(
-            "Failed to upload to Archivist: {}",
-            error
-        )));
+        let status = upload_response.status();
+        let error_body = upload_response.text().await.unwrap_or_default();
+        let error_msg = if error_body.is_empty() {
+            format!("HTTP {}: {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown error"))
+        } else {
+            format!("HTTP {}: {}", status.as_u16(), error_body)
+        };
+        return Ok(JobResult::Error(format!("Failed to upload to Archivist: {}", error_msg)));
     }
 
     let new_cid = upload_response.text().await?.trim().to_string();
@@ -322,7 +375,8 @@ async fn try_import_directory<F>(
     archivist_url: &str,
     cid: &str,
     gateway: Option<&str>,
-    auth_pubkey: Option<&str>,
+    auth: Option<&AuthCredentials>,
+    buffer_pool: &Arc<BufferPool>,
     on_progress: &mut F,
 ) -> anyhow::Result<Option<JobResult>>
 where
@@ -403,9 +457,44 @@ where
             .map(|s| s.to_string())
             .or_else(|| mime_from_name(&link.name));
 
-        let bytes = response.bytes().await?;
-        let size = bytes.len() as u64;
+        // Acquire buffer slot from pool
+        let mut slot = buffer_pool.acquire().await;
+
+        // Stream download into buffer
+        let mut stream = response.bytes_stream();
+        let mut download_failed = false;
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(file = %link.name, error = %e, "Download error, skipping");
+                    download_failed = true;
+                    break;
+                }
+            };
+            if let Err(e) = slot.write_chunk(&chunk) {
+                warn!(file = %link.name, error = %e, "Buffer write error, skipping");
+                download_failed = true;
+                break;
+            }
+        }
+
+        if download_failed {
+            continue;
+        }
+
+        let size = slot.size();
         total_size += size;
+
+        // Read buffer into bytes
+        let bytes = match slot.into_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(file = %link.name, error = %e, "Failed to read buffer, skipping");
+                continue;
+            }
+        };
 
         // Upload to Archivist
         let upload_url = format!("{}/api/archivist/v1/data", archivist_url);
@@ -422,15 +511,38 @@ where
             request = request.header("Content-Type", ct);
         }
 
-        if let Some(pubkey) = auth_pubkey {
-            request = request.header("X-Pubkey", pubkey);
+        // Add auth headers for upload permission
+        if let Some(creds) = auth {
+            request = request
+                .header("X-Pubkey", &creds.pubkey)
+                .header("X-Timestamp", creds.timestamp.to_string())
+                .header("X-Signature", &creds.signature);
         }
 
-        let upload_response = request.send().await?;
+        let upload_response = match request.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let error_msg = if e.is_connect() {
+                    format!("Connection failed - Archivist may be down: {}", e)
+                } else if e.is_timeout() {
+                    format!("Request timed out: {}", e)
+                } else {
+                    format!("Request failed: {}", e)
+                };
+                warn!(file = %link.name, error = %error_msg, "Failed to upload, skipping");
+                continue;
+            }
+        };
 
         if !upload_response.status().is_success() {
-            let error = upload_response.text().await?;
-            warn!(file = %link.name, error = %error, "Failed to upload, skipping");
+            let status = upload_response.status();
+            let error_body = upload_response.text().await.unwrap_or_default();
+            let error_msg = if error_body.is_empty() {
+                format!("HTTP {}: {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown error"))
+            } else {
+                format!("HTTP {}: {}", status.as_u16(), error_body)
+            };
+            warn!(file = %link.name, error = %error_msg, "Failed to upload, skipping");
             continue;
         }
 
@@ -463,18 +575,37 @@ where
 
     let mut request = client.post(&directory_url).json(&directory_request);
 
-    if let Some(pubkey) = auth_pubkey {
-        request = request.header("X-Pubkey", pubkey);
+    // Add auth headers for directory creation
+    if let Some(creds) = auth {
+        request = request
+            .header("X-Pubkey", &creds.pubkey)
+            .header("X-Timestamp", creds.timestamp.to_string())
+            .header("X-Signature", &creds.signature);
     }
 
-    let directory_response = request.send().await?;
+    let directory_response = match request.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let error_msg = if e.is_connect() {
+                format!("Connection failed - Archivist may be down: {}", e)
+            } else if e.is_timeout() {
+                format!("Request timed out: {}", e)
+            } else {
+                format!("Request failed: {}", e)
+            };
+            return Ok(Some(JobResult::Error(format!("Failed to create directory manifest: {}", error_msg))));
+        }
+    };
 
     if !directory_response.status().is_success() {
-        let error = directory_response.text().await?;
-        return Ok(Some(JobResult::Error(format!(
-            "Failed to create directory manifest: {}",
-            error
-        ))));
+        let status = directory_response.status();
+        let error_body = directory_response.text().await.unwrap_or_default();
+        let error_msg = if error_body.is_empty() {
+            format!("HTTP {}: {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown error"))
+        } else {
+            format!("HTTP {}: {}", status.as_u16(), error_body)
+        };
+        return Ok(Some(JobResult::Error(format!("Failed to create directory manifest: {}", error_msg))));
     }
 
     let directory: DirectoryResponse = directory_response.json().await?;

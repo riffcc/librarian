@@ -50,6 +50,9 @@ pub mod api;
 /// Background job worker.
 pub mod worker;
 
+/// Authentication for Archivist uploads.
+pub mod auth;
+
 // === External Service Clients ===
 
 /// Archive.org API client (preserved from original).

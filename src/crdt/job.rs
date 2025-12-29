@@ -107,7 +107,22 @@ pub enum JobResult {
 
     /// Import completed.
     Import {
+        /// Number of audio files imported.
         files_imported: usize,
+        /// Directory CID in Archivist.
+        directory_cid: String,
+        /// Source identifier (e.g., "archive.org:tou2016").
+        source: String,
+        /// Extracted album/release title.
+        title: Option<String>,
+        /// Extracted artist name.
+        artist: Option<String>,
+        /// Release date.
+        date: Option<String>,
+        /// License URL from source.
+        license_url: Option<String>,
+        /// Detected license type (e.g., "CC BY-SA").
+        license_type: Option<String>,
     },
 
     /// Source import completed - URL/CID imported to Archivist.
@@ -205,6 +220,11 @@ pub struct Job {
     /// Must be within 24 hours of upload execution.
     #[serde(default)]
     pub auth_timestamp: Option<u64>,
+
+    /// Retry counter - incremented when job is retried.
+    /// Higher retry_count takes precedence in merge, allowing status reset.
+    #[serde(default)]
+    pub retry_count: u64,
 }
 
 /// Upload authorization credentials for Archivist.
@@ -247,6 +267,7 @@ impl Job {
             auth_pubkey: auth.pubkey,
             auth_signature: auth.signature,
             auth_timestamp: auth.timestamp,
+            retry_count: 0,
         }
     }
 
@@ -294,27 +315,56 @@ impl Job {
         };
         self.result = Some(result);
     }
+
+    /// Retry a failed or completed job.
+    /// Increments retry_count, resets status to Pending, clears claims and result.
+    /// The higher retry_count ensures this state wins in CRDT merge.
+    pub fn retry(&mut self) {
+        self.retry_count += 1;
+        self.status = JobStatus::Pending;
+        self.claims.clear();
+        self.result = None;
+    }
+
+    /// Check if job can be retried (failed or completed).
+    pub fn can_retry(&self) -> bool {
+        matches!(self.status, JobStatus::Failed | JobStatus::Completed)
+    }
 }
 
 impl TotalMerge for Job {
     /// Total merge - cannot fail, preserves all information.
     ///
     /// Properties (proven in Lean):
-    /// - Lossless: All claims are preserved in the union
+    /// - Lossless: All claims are preserved in the union (within same retry epoch)
     /// - Total: Merge always succeeds, returns valid Job
     /// - Deterministic: Same inputs -> same output
     /// - Convergent: Same operations applied -> same state
+    ///
+    /// Retry semantics:
+    /// - Higher retry_count takes precedence (allows status reset on retry)
+    /// - Within same retry_count, standard lattice merge applies
     fn merge(&self, other: &Self) -> Self {
         debug_assert_eq!(self.id, other.id, "Cannot merge jobs with different IDs");
 
-        // Status: lattice join (max)
-        let status = self.status.max(other.status);
+        // Retry count: max (higher retry wins)
+        let retry_count = self.retry_count.max(other.retry_count);
 
-        // Claims: union (lossless - no claim is lost)
-        let claims: BTreeSet<U256> = self.claims.union(&other.claims).cloned().collect();
-
-        // Result: first completed result (idempotent)
-        let result = self.result.clone().or_else(|| other.result.clone());
+        // If retry counts differ, take state from the one with higher retry_count
+        // This allows retry() to reset status/claims/result
+        let (status, claims, result) = if self.retry_count > other.retry_count {
+            // Self has higher retry - use its state
+            (self.status, self.claims.clone(), self.result.clone())
+        } else if other.retry_count > self.retry_count {
+            // Other has higher retry - use its state
+            (other.status, other.claims.clone(), other.result.clone())
+        } else {
+            // Same retry count - use standard lattice merge
+            let status = self.status.max(other.status);
+            let claims: BTreeSet<U256> = self.claims.union(&other.claims).cloned().collect();
+            let result = self.result.clone().or_else(|| other.result.clone());
+            (status, claims, result)
+        };
 
         // Auth fields: first non-None wins (set at creation, never changes)
         let auth_pubkey = self.auth_pubkey.clone().or_else(|| other.auth_pubkey.clone());
@@ -332,6 +382,7 @@ impl TotalMerge for Job {
             auth_pubkey,
             auth_signature,
             auth_timestamp,
+            retry_count,
         }
     }
 }

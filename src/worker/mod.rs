@@ -8,33 +8,52 @@
 //! - Job created → notification sent → worker wakes → job executes
 //! - Zero latency, zero wasted CPU cycles
 
+pub mod buffer;
 pub mod import;
 pub mod source;
 
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::api::{ApiState, JobNotification};
+use crate::auth::Auth;
 use crate::crdt::{Job, JobResult, JobTarget, JobType};
 
-/// Configuration for the job worker.
-#[derive(Debug, Clone)]
-pub struct WorkerConfig {
-    /// Maximum concurrent jobs.
-    pub max_concurrent: usize,
+pub use buffer::{BufferPool, BufferPoolConfig, BufferSlot};
 
+/// Configuration for the job worker.
+#[derive(Clone)]
+pub struct WorkerConfig {
     /// Archivist API URL for uploads.
     pub archivist_url: String,
+
+    /// Authentication for Archivist uploads.
+    /// If None, uploads will fail with 403.
+    pub auth: Option<Auth>,
+
+    /// Buffer pool configuration.
+    pub buffer: BufferPoolConfig,
 }
 
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            max_concurrent: 2,
             archivist_url: "http://localhost:8080".to_string(),
+            auth: None,
+            buffer: BufferPoolConfig::default(),
         }
+    }
+}
+
+impl std::fmt::Debug for WorkerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerConfig")
+            .field("archivist_url", &self.archivist_url)
+            .field("auth", &self.auth.as_ref().map(|a| a.public_key()))
+            .field("buffer", &self.buffer)
+            .finish()
     }
 }
 
@@ -49,12 +68,15 @@ impl Default for WorkerConfig {
 pub struct JobWorker {
     state: Arc<ApiState>,
     config: WorkerConfig,
+    /// Shared buffer pool for all downloads
+    buffer_pool: Arc<BufferPool>,
 }
 
 impl JobWorker {
     /// Create a new job worker.
     pub fn new(state: Arc<ApiState>, config: WorkerConfig) -> Self {
-        Self { state, config }
+        let buffer_pool = BufferPool::new(config.buffer.clone());
+        Self { state, config, buffer_pool }
     }
 
     /// Run the worker - waits on channel for job notifications.
@@ -152,12 +174,19 @@ impl JobWorker {
 
         info!(identifier = %identifier, "Importing from Archive.org");
 
+        // Get auth credentials - warn if not configured
+        let auth_creds = self.config.auth.as_ref().map(|a| a.create_credentials());
+        if auth_creds.is_none() {
+            warn!("No auth configured - uploads may fail with 403. Run 'librarian init' first.");
+        }
+
         let job_id_hex = hex::encode(job.id.as_bytes());
         let result = import::execute_import(
             &self.state.http_client,
             &self.config.archivist_url,
             &identifier,
-            job.auth_pubkey.as_deref(),
+            auth_creds.as_ref(),
+            &self.buffer_pool,
             |progress, message| {
                 if let Some(msg) = message {
                     debug!(job_id = %job_id_hex, progress = %progress, message = %msg, "Import progress");
@@ -182,13 +211,20 @@ impl JobWorker {
 
         info!(source = %source, "Importing from URL/CID");
 
+        // Get auth credentials - warn if not configured
+        let auth_creds = self.config.auth.as_ref().map(|a| a.create_credentials());
+        if auth_creds.is_none() {
+            warn!("No auth configured - uploads may fail with 403. Run 'librarian init' first.");
+        }
+
         let job_id_hex = hex::encode(job.id.as_bytes());
         let result = source::execute_source_import(
             &self.state.http_client,
             &self.config.archivist_url,
             &source,
             gateway.as_deref(),
-            job.auth_pubkey.as_deref(),
+            auth_creds.as_ref(),
+            &self.buffer_pool,
             |progress, message, speed| {
                 if let Some(msg) = message {
                     if let Some(spd) = speed {

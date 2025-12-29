@@ -10,6 +10,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use librarian::{
     api::{self, ApiState},
+    auth::{self, Auth},
     node::{LibrarianNode, NodeConfig},
     worker::{self, WorkerConfig, create_job_channel},
 };
@@ -24,6 +25,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize Librarian configuration (generate keypair for Archivist auth).
+    Init {
+        /// Data directory for configuration.
+        #[arg(long, env = "LIBRARIAN_DATA_DIR")]
+        data_dir: Option<std::path::PathBuf>,
+    },
+
+    /// Show configuration (public key, data directory).
+    Show {
+        /// Data directory for configuration.
+        #[arg(long, env = "LIBRARIAN_DATA_DIR")]
+        data_dir: Option<std::path::PathBuf>,
+    },
+
     /// Start the REST API daemon.
     Daemon {
         /// Address to bind the API server.
@@ -37,6 +52,19 @@ enum Commands {
         /// Data directory for node storage.
         #[arg(long, env = "LIBRARIAN_DATA_DIR")]
         data_dir: Option<std::path::PathBuf>,
+
+        /// Maximum memory for download buffers (e.g., "6G", "512M").
+        /// Downloads exceeding this will spill to temp files.
+        #[arg(long, default_value = "6G", env = "LIBRARIAN_BUFFER")]
+        buffer: String,
+
+        /// Maximum disk space for temp file buffers (e.g., "100G", "50G").
+        #[arg(long, default_value = "100G", env = "LIBRARIAN_DISK")]
+        disk: String,
+
+        /// Maximum concurrent file transfers.
+        #[arg(long, default_value = "8", env = "LIBRARIAN_CONCURRENT")]
+        concurrent: usize,
     },
 
     /// Start the interactive TUI.
@@ -86,12 +114,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Init { data_dir } => {
+            cmd_init(data_dir)?;
+        }
+
+        Commands::Show { data_dir } => {
+            cmd_show(data_dir)?;
+        }
+
         Commands::Daemon {
             bind,
             archivist_url,
             data_dir,
+            buffer,
+            disk,
+            concurrent,
         } => {
-            run_daemon(&bind, &archivist_url, data_dir).await?;
+            run_daemon(&bind, &archivist_url, data_dir, &buffer, &disk, concurrent).await?;
         }
 
         Commands::Tui => {
@@ -123,14 +162,42 @@ async fn run_daemon(
     bind: &str,
     archivist_url: &str,
     data_dir: Option<std::path::PathBuf>,
+    buffer_size: &str,
+    disk_size: &str,
+    concurrent: usize,
 ) -> Result<()> {
     tracing::info!("Starting Librarian daemon...");
 
+    // Parse buffer sizes
+    let max_memory = worker::BufferPoolConfig::parse_size(buffer_size)
+        .ok_or_else(|| anyhow::anyhow!("Invalid buffer size: {}", buffer_size))?;
+    let max_disk = worker::BufferPoolConfig::parse_size(disk_size)
+        .ok_or_else(|| anyhow::anyhow!("Invalid disk size: {}", disk_size))?;
+
     // Create node config
-    let config = if let Some(dir) = data_dir {
-        NodeConfig::new(dir)
-    } else {
-        NodeConfig::default()
+    let data_dir = data_dir.unwrap_or_else(auth::default_data_dir);
+    let config = NodeConfig::new(data_dir.clone());
+
+    // Try to load auth keypair
+    let keypair_path = auth::keypair_path(&data_dir);
+    let auth = match Auth::load(&keypair_path) {
+        Ok(auth) => {
+            tracing::info!(
+                pubkey = %auth.public_key(),
+                "Loaded authentication keypair"
+            );
+            Some(auth)
+        }
+        Err(auth::AuthError::NoKeypair(_)) => {
+            tracing::warn!(
+                "No auth keypair found. Run 'librarian init' to enable Archivist uploads."
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to load auth keypair");
+            None
+        }
     };
 
     // Initialize node
@@ -146,10 +213,19 @@ async fn run_daemon(
     // Create API state with job notification sender
     let state = Arc::new(ApiState::new(node, archivist_url.to_string(), job_tx));
 
+    // Configure buffer pool
+    let buffer_config = worker::BufferPoolConfig {
+        max_memory,
+        max_disk,
+        max_concurrent: concurrent,
+        spill_threshold: 64 * 1024 * 1024, // 64 MiB per file
+    };
+
     // Start event-driven job worker (waits on channel, wakes immediately on job creation)
     let worker_config = WorkerConfig {
         archivist_url: archivist_url.to_string(),
-        ..Default::default()
+        auth,
+        buffer: buffer_config,
     };
     let _worker_handle = worker::spawn_worker(state.clone(), worker_config, job_rx);
     tracing::info!("Job worker started (event-driven)");
@@ -315,6 +391,69 @@ async fn create_job(api_url: &str, job_type: &str, target: &str) -> Result<()> {
     println!("Type:   {}", job["job_type"]);
     println!("Target: {}", job["target"]);
     println!("Status: {}", job["status"]);
+
+    Ok(())
+}
+
+/// Initialize Librarian configuration.
+fn cmd_init(data_dir: Option<std::path::PathBuf>) -> Result<()> {
+    let data_dir = data_dir.unwrap_or_else(auth::default_data_dir);
+    let keypair_path = auth::keypair_path(&data_dir);
+
+    match Auth::init(&keypair_path) {
+        Ok(auth) => {
+            println!("Initialized Librarian configuration");
+            println!();
+            println!("Data directory: {}", data_dir.display());
+            println!("Keypair file:   {}", keypair_path.display());
+            println!();
+            println!("Your public key:");
+            println!("  {}", auth.public_key());
+            println!();
+            println!("Grant this key upload permission on Archivist:");
+            println!("  lens-admin --url <LENS_URL> grant-upload {}", auth.public_key());
+            Ok(())
+        }
+        Err(auth::AuthError::KeypairExists(path)) => {
+            anyhow::bail!(
+                "Keypair already exists at {}\nDelete it first if you want to regenerate.",
+                path.display()
+            );
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Show Librarian configuration.
+fn cmd_show(data_dir: Option<std::path::PathBuf>) -> Result<()> {
+    let data_dir = data_dir.unwrap_or_else(auth::default_data_dir);
+    let keypair_path = auth::keypair_path(&data_dir);
+
+    println!("Librarian Configuration");
+    println!("=======================");
+    println!();
+    println!("Data directory: {}", data_dir.display());
+    println!("Keypair file:   {}", keypair_path.display());
+
+    match Auth::load(&keypair_path) {
+        Ok(auth) => {
+            println!();
+            println!("Public key:");
+            println!("  {}", auth.public_key());
+            println!();
+            println!("Status: Initialized");
+        }
+        Err(auth::AuthError::NoKeypair(_)) => {
+            println!();
+            println!("Status: Not initialized");
+            println!();
+            println!("Run 'librarian init' to generate a keypair.");
+        }
+        Err(e) => {
+            println!();
+            println!("Status: Error - {}", e);
+        }
+    }
 
     Ok(())
 }
