@@ -48,6 +48,7 @@ impl From<&Job> for JobResponse {
             JobType::Transcode => "transcode",
             JobType::Migrate => "migrate",
             JobType::Import => "import",
+            JobType::SourceImport => "source_import",
         };
 
         let target = match &job.target {
@@ -55,6 +56,7 @@ impl From<&Job> for JobResponse {
             JobTarget::Category(cat) => format!("category:{}", cat),
             JobTarget::All => "all".to_string(),
             JobTarget::ArchiveOrgItem(id) => format!("archive.org:{}", id),
+            JobTarget::Source { source, .. } => format!("source:{}", source),
         };
 
         let status = format!("{:?}", job.status);
@@ -229,6 +231,7 @@ pub async fn create_job(
         "transcode" => JobType::Transcode,
         "migrate" => JobType::Migrate,
         "import" => JobType::Import,
+        "source_import" => JobType::SourceImport,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,

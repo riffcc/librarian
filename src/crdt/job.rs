@@ -30,6 +30,9 @@ pub enum JobType {
 
     /// Import from Archive.org.
     Import,
+
+    /// Import from URL or CID (IPFS/Archivist).
+    SourceImport,
 }
 
 /// Job status as a lattice - merge takes "most progressed".
@@ -68,6 +71,17 @@ pub enum JobTarget {
 
     /// Archive.org item identifier.
     ArchiveOrgItem(String),
+
+    /// URL or CID source for import.
+    /// Contains the source URL/CID and optional gateway override.
+    Source {
+        /// The source URL or CID (http://, https://, Qm..., bafy..., zD..., zE...).
+        source: String,
+        /// Optional gateway URL for CID resolution.
+        gateway: Option<String>,
+        /// Optional release ID to update after import.
+        existing_release_id: Option<String>,
+    },
 }
 
 /// Result of a completed job.
@@ -94,6 +108,18 @@ pub enum JobResult {
     /// Import completed.
     Import {
         files_imported: usize,
+    },
+
+    /// Source import completed - URL/CID imported to Archivist.
+    SourceImport {
+        /// Original source URL or CID.
+        source: String,
+        /// New Archivist CID.
+        new_cid: String,
+        /// Size in bytes.
+        size: u64,
+        /// Content type if detected.
+        content_type: Option<String>,
     },
 
     /// Job failed with error message.

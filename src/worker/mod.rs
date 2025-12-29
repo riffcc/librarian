@@ -9,6 +9,7 @@
 //! - Zero latency, zero wasted CPU cycles
 
 pub mod import;
+pub mod source;
 
 use std::sync::Arc;
 
@@ -117,6 +118,7 @@ impl JobWorker {
         // Execute based on job type
         let result = match job.job_type {
             JobType::Import => self.execute_import(&job).await,
+            JobType::SourceImport => self.execute_source_import(&job).await,
             JobType::Audit => self.execute_audit(&job).await,
             JobType::Transcode => self.execute_transcode(&job).await,
             JobType::Migrate => self.execute_migrate(&job).await,
@@ -159,6 +161,41 @@ impl JobWorker {
             |progress, message| {
                 if let Some(msg) = message {
                     debug!(job_id = %job_id_hex, progress = %progress, message = %msg, "Import progress");
+                }
+            },
+        )
+        .await?;
+
+        Ok(result)
+    }
+
+    /// Execute a source import job (URL/CID).
+    async fn execute_source_import(&self, job: &Job) -> anyhow::Result<JobResult> {
+        let (source, gateway, _existing_release_id) = match &job.target {
+            JobTarget::Source {
+                source,
+                gateway,
+                existing_release_id,
+            } => (source.clone(), gateway.clone(), existing_release_id.clone()),
+            _ => anyhow::bail!("SourceImport job requires Source target"),
+        };
+
+        info!(source = %source, "Importing from URL/CID");
+
+        let job_id_hex = hex::encode(job.id.as_bytes());
+        let result = source::execute_source_import(
+            &self.state.http_client,
+            &self.config.archivist_url,
+            &source,
+            gateway.as_deref(),
+            job.auth_pubkey.as_deref(),
+            |progress, message, speed| {
+                if let Some(msg) = message {
+                    if let Some(spd) = speed {
+                        debug!(job_id = %job_id_hex, progress = %progress, message = %msg, speed = %spd, "Source import progress");
+                    } else {
+                        debug!(job_id = %job_id_hex, progress = %progress, message = %msg, "Source import progress");
+                    }
                 }
             },
         )

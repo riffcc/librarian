@@ -163,6 +163,21 @@ impl LibrarianNode {
         Ok(job)
     }
 
+    /// Create a new job with full upload authorization (pubkey, signature, timestamp).
+    pub fn create_job_with_auth_full(
+        &mut self,
+        job_type: JobType,
+        target: JobTarget,
+        auth: UploadAuth,
+    ) -> Result<Job> {
+        let job = Job::new_with_auth(job_type, target, auth);
+        self.store.put(&job)?;
+
+        debug!(job_id = %job.id, job_type = ?job.job_type, "Created new job with full auth");
+
+        Ok(job)
+    }
+
     /// Get a job by ID.
     pub fn get_job(&self, id: &ContentId) -> Result<Option<Job>> {
         Ok(self.store.get(id)?)

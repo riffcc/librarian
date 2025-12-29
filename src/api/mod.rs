@@ -117,6 +117,11 @@ pub fn router(state: Arc<ApiState>) -> Router {
         )
         // WebSocket
         .route("/api/v1/ws", get(handlers::websocket::handler))
+        // Sources (URL/CID import)
+        .route(
+            "/api/v1/sources/import",
+            post(handlers::sources::import_source),
+        )
         // Middleware
         .layer(cors)
         .layer(TraceLayer::new_for_http())
