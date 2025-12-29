@@ -119,10 +119,9 @@ pub enum JobResult {
         artist: Option<String>,
         /// Release date.
         date: Option<String>,
-        /// License URL from source.
-        license_url: Option<String>,
-        /// Detected license type (e.g., "CC BY-SA").
-        license_type: Option<String>,
+        /// Structured license info as JSON string (matches Flagship's LicenseInfo format).
+        /// Contains: type, version, jurisdiction, url
+        license: Option<String>,
     },
 
     /// Source import completed - URL/CID imported to Archivist.

@@ -184,35 +184,109 @@ fn generate_track_filename(file: &ArchiveFileEntry, track_num: Option<u32>) -> S
     }
 }
 
-/// Detect license type from URL.
-fn detect_license_type(license_url: &Option<String>) -> Option<String> {
-    let url = license_url.as_ref()?.to_lowercase();
+/// Structured license info matching Flagship's format.
+/// Stored as JSON string in release metadata.license field.
+#[derive(Debug, Clone, Serialize)]
+pub struct LicenseInfo {
+    /// License type: cc0, cc-by, cc-by-sa, cc-by-nd, cc-by-nc, cc-by-nc-sa, cc-by-nc-nd, custom
+    #[serde(rename = "type")]
+    pub license_type: String,
+    /// Version: 4.0, 3.0, 2.5, 2.0, 1.0, unknown
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Jurisdiction country code: us, uk, de, au, etc. Empty = International
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jurisdiction: Option<String>,
+    /// Original license URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
 
-    if url.contains("creativecommons.org") {
-        if url.contains("/publicdomain/") || url.contains("/zero/") || url.contains("cc0") {
-            Some("CC0 (Public Domain)".to_string())
-        } else if url.contains("by-nc-nd") {
-            Some("CC BY-NC-ND".to_string())
-        } else if url.contains("by-nc-sa") {
-            Some("CC BY-NC-SA".to_string())
-        } else if url.contains("by-nc") {
-            Some("CC BY-NC".to_string())
-        } else if url.contains("by-nd") {
-            Some("CC BY-ND".to_string())
-        } else if url.contains("by-sa") {
-            Some("CC BY-SA".to_string())
-        } else if url.contains("/by/") {
-            Some("CC BY".to_string())
-        } else {
-            Some("Creative Commons".to_string())
-        }
-    } else if url.contains("gnu.org") {
-        Some("GPL".to_string())
-    } else if url.contains("opensource.org") {
-        Some("Open Source".to_string())
-    } else {
-        None
+/// Parse license info from URL, extracting type, version, and jurisdiction.
+/// Returns structured LicenseInfo matching Flagship's format.
+fn parse_license_info(license_url: &Option<String>) -> Option<LicenseInfo> {
+    let url = license_url.as_ref()?;
+    let url_lower = url.to_lowercase();
+
+    if !url_lower.contains("creativecommons.org") {
+        return None;
     }
+
+    // Extract version from URL (e.g., "/4.0/", "/3.0/", "/2.5/")
+    let version = extract_license_version(&url_lower);
+
+    // Extract jurisdiction from URL (e.g., "/deed.de", "/de/", country-specific ports)
+    let jurisdiction = extract_license_jurisdiction(&url_lower);
+
+    // Detect license type - order matters (most specific first)
+    let license_type = if url_lower.contains("/publicdomain/") || url_lower.contains("/zero/") || url_lower.contains("cc0") {
+        "cc0"
+    } else if url_lower.contains("by-nc-nd") {
+        "cc-by-nc-nd"
+    } else if url_lower.contains("by-nc-sa") {
+        "cc-by-nc-sa"
+    } else if url_lower.contains("by-nc") {
+        "cc-by-nc"
+    } else if url_lower.contains("by-nd") {
+        "cc-by-nd"
+    } else if url_lower.contains("by-sa") {
+        "cc-by-sa"
+    } else if url_lower.contains("/by/") || url_lower.contains("/by-") {
+        "cc-by"
+    } else {
+        return None; // Unknown CC license type
+    };
+
+    Some(LicenseInfo {
+        license_type: license_type.to_string(),
+        version,
+        jurisdiction,
+        url: Some(url.clone()),
+    })
+}
+
+/// Extract version number from CC license URL.
+fn extract_license_version(url: &str) -> Option<String> {
+    // Common version patterns: /4.0/, /3.0/, /2.5/, /2.0/, /1.0/
+    let versions = ["4.0", "3.0", "2.5", "2.0", "1.0"];
+
+    for v in versions {
+        if url.contains(&format!("/{}/", v)) || url.ends_with(&format!("/{}", v)) {
+            return Some(v.to_string());
+        }
+    }
+
+    None
+}
+
+/// Extract jurisdiction country code from CC license URL.
+/// Returns country code like "us", "uk", "de" or None for international.
+fn extract_license_jurisdiction(url: &str) -> Option<String> {
+    // Jurisdiction patterns in CC URLs:
+    // - /licenses/by/3.0/us/
+    // - /licenses/by/3.0/deed.de
+    // - https://creativecommons.org/licenses/by-sa/2.0/uk/
+
+    // Known jurisdiction codes (subset - most common)
+    let jurisdictions = [
+        "au", "at", "be", "br", "ca", "cl", "cn", "co", "hr", "cz",
+        "dk", "ec", "fi", "fr", "de", "gr", "hk", "hu", "in", "ie",
+        "il", "it", "jp", "kr", "my", "mx", "nl", "nz", "no", "pe",
+        "ph", "pl", "pt", "ro", "rs", "sg", "za", "es", "se", "ch",
+        "tw", "th", "uk", "us", "vn",
+    ];
+
+    // Check for /jurisdiction/ or /deed.jurisdiction patterns
+    for j in jurisdictions {
+        if url.contains(&format!("/{}/", j)) || url.ends_with(&format!("/{}", j)) {
+            return Some(j.to_string());
+        }
+        if url.contains(&format!("/deed.{}", j)) {
+            return Some(j.to_string());
+        }
+    }
+
+    None
 }
 
 /// Audio formats to import.
@@ -454,14 +528,13 @@ where
     let album_title = extract_string(&metadata.metadata.title);
     let album_artist = extract_string(&metadata.metadata.creator);
     let album_date = metadata.metadata.date.clone();
-    let license_url = metadata.metadata.licenseurl.clone();
-    let license_type = detect_license_type(&license_url);
+    let license_info = parse_license_info(&metadata.metadata.licenseurl);
 
     info!(
         identifier = %identifier,
         title = ?album_title,
         artist = ?album_artist,
-        license = ?license_type,
+        license = ?license_info,
         "Extracted metadata"
     );
 
@@ -639,13 +712,18 @@ where
         .find_map(|f| f.artist.clone())  // First ID3 artist tag
         .or(album_artist.clone());  // Then Archive.org creator
 
+    // Serialize license info to JSON for Flagship compatibility
+    let license_json = license_info
+        .as_ref()
+        .and_then(|li| serde_json::to_string(li).ok());
+
     info!(
         identifier = %identifier,
         cid = %directory.cid,
         audio_files = audio_count,
         title = ?final_title,
         artist = ?final_artist,
-        license = ?license_type,
+        license = ?license_info,
         "Import complete"
     );
 
@@ -658,8 +736,7 @@ where
         title: final_title,
         artist: final_artist,
         date: album_date,
-        license_url,
-        license_type,
+        license: license_json,
     })
 }
 
@@ -741,15 +818,55 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_license_type() {
-        assert_eq!(
-            detect_license_type(&Some("http://creativecommons.org/licenses/by-sa/4.0/".to_string())),
-            Some("CC BY-SA".to_string())
-        );
-        assert_eq!(
-            detect_license_type(&Some("http://creativecommons.org/publicdomain/zero/1.0/".to_string())),
-            Some("CC0 (Public Domain)".to_string())
-        );
-        assert_eq!(detect_license_type(&None), None);
+    fn test_parse_license_info() {
+        // CC BY-SA 4.0 International
+        let info = parse_license_info(&Some("http://creativecommons.org/licenses/by-sa/4.0/".to_string()));
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.license_type, "cc-by-sa");
+        assert_eq!(info.version, Some("4.0".to_string()));
+        assert_eq!(info.jurisdiction, None);
+
+        // CC0 1.0
+        let info = parse_license_info(&Some("http://creativecommons.org/publicdomain/zero/1.0/".to_string()));
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.license_type, "cc0");
+        assert_eq!(info.version, Some("1.0".to_string()));
+
+        // CC BY 3.0 US (with jurisdiction)
+        let info = parse_license_info(&Some("http://creativecommons.org/licenses/by/3.0/us/".to_string()));
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.license_type, "cc-by");
+        assert_eq!(info.version, Some("3.0".to_string()));
+        assert_eq!(info.jurisdiction, Some("us".to_string()));
+
+        // CC BY-NC-SA 2.5 (older version)
+        let info = parse_license_info(&Some("http://creativecommons.org/licenses/by-nc-sa/2.5/".to_string()));
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.license_type, "cc-by-nc-sa");
+        assert_eq!(info.version, Some("2.5".to_string()));
+
+        // Non-CC URL returns None
+        assert!(parse_license_info(&Some("http://example.com/license".to_string())).is_none());
+        assert!(parse_license_info(&None).is_none());
+    }
+
+    #[test]
+    fn test_extract_license_version() {
+        assert_eq!(extract_license_version("http://creativecommons.org/licenses/by/4.0/"), Some("4.0".to_string()));
+        assert_eq!(extract_license_version("http://creativecommons.org/licenses/by/3.0/us/"), Some("3.0".to_string()));
+        assert_eq!(extract_license_version("http://creativecommons.org/licenses/by/2.5/"), Some("2.5".to_string()));
+        assert_eq!(extract_license_version("http://example.com/"), None);
+    }
+
+    #[test]
+    fn test_extract_license_jurisdiction() {
+        assert_eq!(extract_license_jurisdiction("http://creativecommons.org/licenses/by/3.0/us/"), Some("us".to_string()));
+        assert_eq!(extract_license_jurisdiction("http://creativecommons.org/licenses/by/3.0/de/"), Some("de".to_string()));
+        assert_eq!(extract_license_jurisdiction("http://creativecommons.org/licenses/by/4.0/deed.uk"), Some("uk".to_string()));
+        assert_eq!(extract_license_jurisdiction("http://creativecommons.org/licenses/by/4.0/"), None); // International
     }
 }
