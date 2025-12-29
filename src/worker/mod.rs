@@ -4,22 +4,26 @@
 //! When a job is created, the API sends a notification and the worker
 //! wakes immediately to execute it.
 //!
-//! Jobs run in PARALLEL up to the configured concurrency limit.
-//! Each job is spawned as a separate task, with a semaphore controlling
-//! max concurrent executions.
+//! File downloads run in PARALLEL across all jobs, controlled by the
+//! BufferPool's semaphore. This means:
+//! - An album with 10 tracks downloads 8 tracks concurrently (up to max_concurrent)
+//! - Multiple jobs can run simultaneously, sharing the global concurrency limit
+//! - BufferPool enforces the global file download limit across all jobs
 //!
 //! This is the correct pattern:
 //! - Job created → notification sent → worker wakes → job spawned
-//! - Multiple jobs execute concurrently (up to max_concurrent)
+//! - File downloads within jobs run in parallel (buffer_unordered)
+//! - BufferPool semaphore throttles global concurrent file downloads
 //! - Zero latency, zero wasted CPU cycles
 
 pub mod buffer;
 pub mod import;
+pub mod release;
 pub mod source;
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::api::{ApiState, JobNotification};
@@ -34,6 +38,10 @@ pub struct WorkerConfig {
     /// Archivist API URL for uploads.
     pub archivist_url: String,
 
+    /// Citadel Lens API URL for creating releases.
+    /// If None, releases won't be auto-created after import.
+    pub lens_url: Option<String>,
+
     /// Authentication for Archivist uploads.
     /// If None, uploads will fail with 403.
     pub auth: Option<Auth>,
@@ -46,6 +54,7 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             archivist_url: "http://localhost:8080".to_string(),
+            lens_url: None,
             auth: None,
             buffer: BufferPoolConfig::default(),
         }
@@ -56,6 +65,7 @@ impl std::fmt::Debug for WorkerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerConfig")
             .field("archivist_url", &self.archivist_url)
+            .field("lens_url", &self.lens_url)
             .field("auth", &self.auth.as_ref().map(|a| a.public_key()))
             .field("buffer", &self.buffer)
             .finish()
@@ -66,26 +76,22 @@ impl std::fmt::Debug for WorkerConfig {
 ///
 /// Waits on a channel for job notifications. When notified:
 /// 1. Spawns a task to claim and execute the job
-/// 2. Jobs run in parallel up to max_concurrent limit
-/// 3. Semaphore controls concurrency
+/// 2. File downloads run in parallel up to max_concurrent limit
+/// 3. BufferPool's semaphore controls per-file concurrency globally
 ///
-/// NO POLLING. NO SLEEPS. Pure event-driven with parallel execution.
+/// NO POLLING. NO SLEEPS. Pure event-driven with parallel file downloads.
 pub struct JobWorker {
     state: Arc<ApiState>,
     config: WorkerConfig,
-    /// Shared buffer pool for all downloads
+    /// Shared buffer pool for all downloads - controls global concurrency
     buffer_pool: Arc<BufferPool>,
-    /// Semaphore to limit concurrent job executions
-    concurrency: Arc<Semaphore>,
 }
 
 impl JobWorker {
     /// Create a new job worker.
     pub fn new(state: Arc<ApiState>, config: WorkerConfig) -> Self {
-        let max_concurrent = config.buffer.max_concurrent;
         let buffer_pool = BufferPool::new(config.buffer.clone());
-        let concurrency = Arc::new(Semaphore::new(max_concurrent));
-        Self { state, config, buffer_pool, concurrency }
+        Self { state, config, buffer_pool }
     }
 
     /// Run the worker - waits on channel for job notifications.
@@ -121,19 +127,9 @@ impl JobWorker {
     }
 
     /// Try to claim and execute a job.
-    /// Acquires a permit from the concurrency semaphore before executing.
+    /// File downloads within jobs are throttled by the buffer pool's semaphore.
     async fn try_execute_job(&self, job_id: &citadel_crdt::ContentId) -> anyhow::Result<()> {
         let job_id_hex = hex::encode(job_id.as_bytes());
-
-        // Acquire concurrency permit - waits if at max concurrent jobs
-        let _permit = self.concurrency.acquire().await
-            .map_err(|_| anyhow::anyhow!("Concurrency semaphore closed"))?;
-
-        debug!(
-            job_id = %job_id_hex,
-            active_jobs = self.config.buffer.max_concurrent - self.concurrency.available_permits(),
-            "Acquired execution permit"
-        );
 
         // Claim and start the job
         let job = {
@@ -221,6 +217,25 @@ impl JobWorker {
             },
         )
         .await?;
+
+        // If import succeeded, try to create release in Citadel Lens
+        if let JobResult::Import { ref directory_cid, ref title, ref artist, ref source, ref license, ref date, .. } = result {
+            let release_id = release::try_create_release(
+                &self.state.http_client,
+                self.config.lens_url.as_deref(),
+                title.as_deref(),
+                artist.as_deref(),
+                directory_cid,
+                source,
+                license.as_deref(),
+                date.as_deref(),
+                self.config.auth.as_ref(),
+            ).await;
+
+            if let Some(id) = release_id {
+                info!(release_id = %id, "Release created in Citadel Lens moderation queue");
+            }
+        }
 
         Ok(result)
     }

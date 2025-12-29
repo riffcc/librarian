@@ -120,6 +120,22 @@ impl Auth {
             signature: signature_hex,
         }
     }
+
+    /// Sign an arbitrary message.
+    ///
+    /// Returns the hex-encoded Ed25519 signature.
+    pub fn sign(&self, message: &[u8]) -> String {
+        let signature = self.signing_key.sign(message);
+        hex::encode(signature.to_bytes())
+    }
+
+    /// Get the current timestamp in milliseconds (for Citadel Lens API).
+    pub fn timestamp_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
 }
 
 /// Get the default keypair path within a data directory.

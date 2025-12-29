@@ -49,6 +49,11 @@ enum Commands {
         #[arg(long, env = "ARCHIVIST_URL", default_value = "http://localhost:8080")]
         archivist_url: String,
 
+        /// Citadel Lens URL for creating releases after import.
+        /// If not set, releases won't be auto-created in the moderation queue.
+        #[arg(long = "lens", env = "LENS_URL")]
+        lens_url: Option<String>,
+
         /// Data directory for node storage.
         #[arg(long, env = "LIBRARIAN_DATA_DIR")]
         data_dir: Option<std::path::PathBuf>,
@@ -125,12 +130,13 @@ async fn main() -> Result<()> {
         Commands::Daemon {
             bind,
             archivist_url,
+            lens_url,
             data_dir,
             buffer,
             disk,
             concurrent,
         } => {
-            run_daemon(&bind, &archivist_url, data_dir, &buffer, &disk, concurrent).await?;
+            run_daemon(&bind, &archivist_url, lens_url.as_deref(), data_dir, &buffer, &disk, concurrent).await?;
         }
 
         Commands::Tui => {
@@ -161,6 +167,7 @@ async fn main() -> Result<()> {
 async fn run_daemon(
     bind: &str,
     archivist_url: &str,
+    lens_url: Option<&str>,
     data_dir: Option<std::path::PathBuf>,
     buffer_size: &str,
     disk_size: &str,
@@ -224,11 +231,18 @@ async fn run_daemon(
     // Start event-driven job worker (waits on channel, wakes immediately on job creation)
     let worker_config = WorkerConfig {
         archivist_url: archivist_url.to_string(),
+        lens_url: lens_url.map(String::from),
         auth,
         buffer: buffer_config,
     };
     let _worker_handle = worker::spawn_worker(state.clone(), worker_config, job_rx);
     tracing::info!("Job worker started (event-driven)");
+
+    if lens_url.is_some() {
+        tracing::info!(lens_url = ?lens_url, "Release auto-creation enabled");
+    } else {
+        tracing::warn!("No LENS_URL configured - releases won't be auto-created after import");
+    }
 
     // "Nothing is ever really lost to us as long as we remember it."
     // — L.M. Montgomery

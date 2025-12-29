@@ -196,6 +196,11 @@ impl BufferPool {
         self.permits.available_permits()
     }
 
+    /// Get maximum concurrent transfers.
+    pub fn max_concurrent(&self) -> usize {
+        self.config.max_concurrent
+    }
+
     /// Get the configuration.
     pub fn config(&self) -> &BufferPoolConfig {
         &self.config

@@ -3,12 +3,17 @@
 //! Downloads files from Archive.org and uploads them to Archivist,
 //! creating a directory manifest for the complete release.
 //!
+//! Downloads run in PARALLEL up to the buffer pool's max_concurrent limit.
+//! This means a 10-track album with --concurrent=8 downloads 8 tracks at once.
+//!
 //! Extracts rich metadata from Archive.org including:
 //! - Album/release title and artist
 //! - Per-track titles for nice file naming ("01 - Track Name.mp3")
 //! - License information for automatic categorization
 
-use futures_util::StreamExt;
+use std::sync::Arc;
+
+use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -362,6 +367,12 @@ fn mime_from_name(name: &str) -> Option<String> {
         Some("audio/wav".to_string())
     } else if name.ends_with(".aiff") {
         Some("audio/aiff".to_string())
+    } else if name.ends_with(".xml") {
+        Some("application/xml".to_string())
+    } else if name.ends_with(".json") {
+        Some("application/json".to_string())
+    } else if name.ends_with(".txt") {
+        Some("text/plain".to_string())
     } else {
         None
     }
@@ -399,12 +410,16 @@ async fn upload_file(
         return None;
     }
 
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .or_else(|| mime_from_name(file_name));
+    // Get content-type from response, but override for known file types
+    // Archive.org sometimes returns wrong content-types
+    let content_type = mime_from_name(file_name)
+        .or_else(|| {
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        });
 
     // Acquire buffer slot
     let mut slot = buffer_pool.acquire().await;
@@ -476,7 +491,14 @@ async fn upload_file(
 
     if !upload_response.status().is_success() {
         let status = upload_response.status();
-        warn!(file = %file_name, status = %status, "Upload failed, skipping");
+        let error_body = upload_response.text().await.unwrap_or_default();
+        warn!(
+            file = %file_name,
+            status = %status,
+            content_type = ?content_type,
+            error = %error_body,
+            "Upload failed, skipping"
+        );
         return None;
     }
 
@@ -553,90 +575,107 @@ where
         "Found files to import"
     );
 
-    on_progress(0.05, Some(format!("Found {} audio files", audio_files.len())));
-
-    // 4. Download and upload files
-    let mut uploaded_entries: Vec<DirectoryEntry> = Vec::new();
-    let mut track_metadata: Vec<TrackMetadata> = Vec::new();
     let total_files = audio_files.len() + metadata_files.len();
-    let mut file_index = 0;
+    on_progress(0.05, Some(format!("Found {} files, downloading in parallel", total_files)));
 
-    // Upload audio files with nice names
-    for file in &audio_files {
-        let file_progress = 0.05 + (0.85 * (file_index as f32 / total_files as f32));
-        file_index += 1;
+    // 4. Download and upload files IN PARALLEL
+    // The buffer pool's semaphore limits concurrent downloads globally
+    // So with --concurrent=8, we download up to 8 files at once across all jobs
 
+    // Prepare audio file tasks
+    let audio_tasks: Vec<_> = audio_files.iter().map(|file| {
         let track_num = parse_track_number(&file.track);
         let nice_name = generate_track_filename(file, track_num);
+        let original_name = file.name.clone();
+        let title = file.title.clone();
+        let artist = file.artist.clone();
+        let duration = parse_duration(&file.length);
 
-        on_progress(file_progress, Some(format!("Uploading {}", nice_name)));
+        (original_name, nice_name, track_num, title, artist, duration, false)
+    }).collect();
 
-        if let Some((cid, size)) = upload_file(
-            client,
-            archivist_url,
-            identifier,
-            &file.name,
-            &nice_name,
-            auth,
-            buffer_pool,
-        ).await {
-            uploaded_entries.push(DirectoryEntry {
-                path: nice_name.clone(),
-                cid,
-                size,
-                mimetype: mime_from_name(&file.name),
-            });
-
-            track_metadata.push(TrackMetadata {
-                track_number: track_num,
-                title: file.title.clone(),
-                artist: file.artist.clone(),
-                duration: parse_duration(&file.length),
-                filename: nice_name,
-                original_filename: file.name.clone(),
-            });
-        }
-    }
-
-    // Upload metadata files (for attribution/provenance)
-    for file in &metadata_files {
-        let file_progress = 0.05 + (0.85 * (file_index as f32 / total_files as f32));
-        file_index += 1;
-
-        // Keep original name for metadata files (prefixed with underscore)
+    // Prepare metadata file tasks
+    let meta_tasks: Vec<_> = metadata_files.iter().map(|file| {
         let dest_name = if file.name.starts_with('_') {
             file.name.clone()
         } else {
             format!("_{}", file.name)
         };
+        let original_name = file.name.clone();
 
-        on_progress(file_progress, Some(format!("Including {}", dest_name)));
+        (original_name, dest_name, None, None, None, None, true)
+    }).collect();
 
-        if let Some((cid, size)) = upload_file(
-            client,
-            archivist_url,
-            identifier,
-            &file.name,
-            &dest_name,
-            auth,
-            buffer_pool,
-        ).await {
-            let mimetype = if file.name.ends_with(".xml") {
-                Some("application/xml".to_string())
-            } else if file.name.ends_with(".json") {
-                Some("application/json".to_string())
+    // Combine all tasks
+    let all_tasks: Vec<_> = audio_tasks.into_iter().chain(meta_tasks).collect();
+
+    // Process all files in parallel using buffer_unordered
+    // The buffer pool's acquire() naturally throttles to max_concurrent
+    let results: Vec<_> = stream::iter(all_tasks)
+        .map(|(original_name, dest_name, track_num, title, artist, duration, is_meta)| {
+            let client = client.clone();
+            let archivist_url = archivist_url.to_string();
+            let identifier = identifier.to_string();
+            let auth = auth.cloned();
+            let buffer_pool = Arc::clone(buffer_pool);
+
+            async move {
+                let result = upload_file(
+                    &client,
+                    &archivist_url,
+                    &identifier,
+                    &original_name,
+                    &dest_name,
+                    auth.as_ref(),
+                    &buffer_pool,
+                ).await;
+
+                (result, dest_name, original_name, track_num, title, artist, duration, is_meta)
+            }
+        })
+        .buffer_unordered(buffer_pool.max_concurrent()) // Process up to max_concurrent at once
+        .collect()
+        .await;
+
+    // Collect results
+    let mut uploaded_entries: Vec<DirectoryEntry> = Vec::new();
+    let mut track_metadata: Vec<TrackMetadata> = Vec::new();
+
+    for (result, dest_name, original_name, track_num, title, artist, duration, is_meta) in results {
+        if let Some((cid, size)) = result {
+            let mimetype = if is_meta {
+                if original_name.ends_with(".xml") {
+                    Some("application/xml".to_string())
+                } else if original_name.ends_with(".json") {
+                    Some("application/json".to_string())
+                } else {
+                    Some("text/plain".to_string())
+                }
             } else {
-                Some("text/plain".to_string())
+                mime_from_name(&original_name)
             };
 
             uploaded_entries.push(DirectoryEntry {
-                path: dest_name,
+                path: dest_name.clone(),
                 cid,
                 size,
                 mimetype,
             });
+
+            if !is_meta {
+                track_metadata.push(TrackMetadata {
+                    track_number: track_num,
+                    title,
+                    artist,
+                    duration,
+                    filename: dest_name,
+                    original_filename: original_name,
+                });
+            }
         }
     }
+
+    on_progress(0.90, Some(format!("Uploaded {} files", uploaded_entries.len())));
 
     if uploaded_entries.is_empty() {
         return Ok(JobResult::Error("Failed to upload any files".to_string()));
