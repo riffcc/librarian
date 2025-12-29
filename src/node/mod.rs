@@ -22,7 +22,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::crdt::{Job, JobResult, JobStatus, JobTarget, JobType};
+use crate::crdt::{Job, JobResult, JobStatus, JobTarget, JobType, UploadAuth};
 
 pub use config::NodeConfig;
 
@@ -151,7 +151,11 @@ impl LibrarianNode {
         target: JobTarget,
         auth_pubkey: Option<String>,
     ) -> Result<Job> {
-        let job = Job::new_with_auth(job_type, target, auth_pubkey);
+        let auth = UploadAuth {
+            pubkey: auth_pubkey,
+            ..Default::default()
+        };
+        let job = Job::new_with_auth(job_type, target, auth);
         self.store.put(&job)?;
 
         debug!(job_id = %job.id, job_type = ?job.job_type, "Created new job");

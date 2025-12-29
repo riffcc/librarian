@@ -155,6 +155,7 @@ impl JobWorker {
             &self.state.http_client,
             &self.config.archivist_url,
             &identifier,
+            job.auth_pubkey.as_deref(),
             |progress, message| {
                 if let Some(msg) = message {
                     debug!(job_id = %job_id_hex, progress = %progress, message = %msg, "Import progress");
