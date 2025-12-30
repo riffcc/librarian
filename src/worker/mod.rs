@@ -17,6 +17,7 @@
 //! - Zero latency, zero wasted CPU cycles
 
 pub mod buffer;
+pub mod cover;
 pub mod import;
 pub mod release;
 pub mod source;
@@ -150,6 +151,9 @@ impl JobWorker {
                 return Ok(());
             }
 
+            // Claim the job for this node (required before starting)
+            node.claim_job(job_id)?;
+
             // Start the job
             node.start_job(job_id).await?
         };
@@ -204,7 +208,7 @@ impl JobWorker {
         }
 
         let job_id_hex = hex::encode(job.id.as_bytes());
-        let result = import::execute_import(
+        let mut result = import::execute_import(
             &self.state.http_client,
             &self.config.archivist_url,
             &identifier,
@@ -218,19 +222,75 @@ impl JobWorker {
         )
         .await?;
 
-        // If import succeeded, try to create release in Citadel Lens
-        if let JobResult::Import { ref directory_cid, ref title, ref artist, ref source, ref license, ref date, .. } = result {
+        // If import succeeded, try to process cover art and create release
+        if let JobResult::Import {
+            ref directory_cid,
+            ref title,
+            ref artist,
+            ref source,
+            ref license,
+            ref date,
+            ref track_metadata,
+            ref mut thumbnail_cid,
+            ..
+        } = result
+        {
+            // Try to find and upload cover art
+            // First, get the cover candidates from the Archive.org metadata
+            // Note: We already found candidates during import, but we need to re-fetch
+            // the metadata to get the file list for cover art processing
+            let metadata_url = format!("https://archive.org/metadata/{}", identifier);
+            if let Ok(metadata_resp) = self.state.http_client.get(&metadata_url).send().await {
+                if let Ok(metadata) = metadata_resp.json::<serde_json::Value>().await {
+                    // Extract files array and find cover candidates
+                    if let Some(files) = metadata.get("files").and_then(|f| f.as_array()) {
+                        let file_entries: Vec<import::ArchiveFileEntry> = files
+                            .iter()
+                            .filter_map(|f| serde_json::from_value(f.clone()).ok())
+                            .collect();
+
+                        let (_, candidates) = import::find_cover_candidates(&file_entries);
+
+                        if !candidates.is_empty() {
+                            info!(
+                                identifier = %identifier,
+                                candidates = candidates.len(),
+                                "Processing cover art"
+                            );
+
+                            let cover_result = cover::find_and_upload_cover(
+                                &self.state.http_client,
+                                &self.config.archivist_url,
+                                &identifier,
+                                &candidates,
+                                auth_creds.as_ref(),
+                            )
+                            .await;
+
+                            if let Some(cid) = cover_result.thumbnail_cid {
+                                info!(cid = %cid, confident = %cover_result.confident, "Cover art uploaded");
+                                *thumbnail_cid = Some(cid);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Create release in Citadel Lens
             let release_id = release::try_create_release(
                 &self.state.http_client,
                 self.config.lens_url.as_deref(),
                 title.as_deref(),
                 artist.as_deref(),
                 directory_cid,
+                thumbnail_cid.as_deref(),
                 source,
                 license.as_deref(),
                 date.as_deref(),
+                track_metadata.as_deref(),
                 self.config.auth.as_ref(),
-            ).await;
+            )
+            .await;
 
             if let Some(id) = release_id {
                 info!(release_id = %id, "Release created in Citadel Lens moderation queue");
