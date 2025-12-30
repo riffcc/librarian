@@ -586,6 +586,31 @@ impl JobWorker {
         {
             Ok(resp) if resp.status().is_success() => {
                 info!(release_id = %release_id, "Successfully updated release in Citadel Lens");
+
+                // Re-audit the updated release to check remaining issues
+                match audit::fetch_release_by_id(&self.state.http_client, lens_url, release_id).await {
+                    Ok(release) => {
+                        let audit_result = audit::audit_release(&release);
+                        if audit_result.issues.is_empty() {
+                            info!(
+                                release_id = %release_id,
+                                title = %release.name,
+                                "Post-update audit: all issues resolved!"
+                            );
+                        } else {
+                            info!(
+                                release_id = %release_id,
+                                title = %release.name,
+                                remaining_issues = audit_result.issues.len(),
+                                issues = ?audit_result.issues,
+                                "Post-update audit: some issues remain"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        debug!(release_id = %release_id, error = %e, "Could not re-audit release after update");
+                    }
+                }
             }
             Ok(resp) => {
                 let status = resp.status();

@@ -81,6 +81,31 @@ pub async fn fetch_releases(
     Ok(releases)
 }
 
+/// Fetch a single release by ID from Citadel Lens.
+pub async fn fetch_release_by_id(
+    client: &Client,
+    lens_url: &str,
+    release_id: &str,
+) -> anyhow::Result<LensRelease> {
+    let url = format!("{}/api/v1/releases/{}", lens_url.trim_end_matches('/'), release_id);
+
+    debug!(url = %url, release_id = %release_id, "Fetching release from Citadel Lens");
+
+    let response = client
+        .get(&url)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Failed to fetch release {}: {} - {}", release_id, status, body);
+    }
+
+    let release: LensRelease = response.json().await?;
+    Ok(release)
+}
+
 /// Check if a CID is an Archivist CID (starts with zD or zE).
 fn is_archivist_cid(cid: &str) -> bool {
     cid.starts_with("zD") || cid.starts_with("zE")
