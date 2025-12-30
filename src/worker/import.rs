@@ -50,19 +50,20 @@ struct ArchiveItemMetadata {
     licenseurl: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ArchiveFileEntry {
-    name: String,
-    format: Option<String>,
-    size: Option<String>,
-    source: Option<String>,
+/// Archive.org file entry from metadata API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArchiveFileEntry {
+    pub name: String,
+    pub format: Option<String>,
+    pub size: Option<String>,
+    pub source: Option<String>,
     // Rich metadata from ID3/Vorbis tags (extracted by Archive.org)
-    title: Option<String>,
-    artist: Option<String>,
-    album: Option<String>,
-    track: Option<String>,
-    length: Option<String>,
-    genre: Option<String>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub track: Option<String>,
+    pub length: Option<String>,
+    pub genre: Option<String>,
 }
 
 /// Archivist directory response.
@@ -112,15 +113,17 @@ pub struct TrackMetadata {
 }
 
 /// Extract first string from a JSON value (handles string or array).
+/// Also unescapes backslash-escaped characters from Archive.org.
 fn extract_string(value: &Option<serde_json::Value>) -> Option<String> {
-    match value {
+    let raw = match value {
         Some(serde_json::Value::String(s)) => Some(s.clone()),
         Some(serde_json::Value::Array(arr)) => arr
             .first()
             .and_then(|v| v.as_str())
             .map(String::from),
         _ => None,
-    }
+    };
+    raw.map(|s| unescape_archive_metadata(&s))
 }
 
 /// Parse track number from Archive.org format (e.g., "1", "01", "1/12").
@@ -294,50 +297,286 @@ fn extract_license_jurisdiction(url: &str) -> Option<String> {
     None
 }
 
-/// Audio formats to import.
-const AUDIO_FORMATS: &[&str] = &[
-    "VBR MP3",
-    "MP3",
-    "Ogg Vorbis",
-    "FLAC",
-    "Apple Lossless Audio",
-    "AIFF",
-    "WAV",
-    "Opus",
-    "AAC",
-    "M4A",
-];
-
 /// Metadata file formats to include for attribution/provenance.
 const METADATA_FORMATS: &[&str] = &[
     "Metadata",
     "Text",
 ];
 
-/// Check if a file is an audio file.
-fn is_audio_file(file: &ArchiveFileEntry) -> bool {
-    if let Some(format) = &file.format {
-        AUDIO_FORMATS.iter().any(|f| format.contains(f))
-    } else {
-        // Check extension if no format specified
-        let name = file.name.to_lowercase();
-        name.ends_with(".mp3")
-            || name.ends_with(".flac")
-            || name.ends_with(".ogg")
-            || name.ends_with(".opus")
-            || name.ends_with(".m4a")
-            || name.ends_with(".aac")
-            || name.ends_with(".wav")
-            || name.ends_with(".aiff")
+/// Image formats that might contain cover art.
+const IMAGE_FORMATS: &[&str] = &[
+    "JPEG",
+    "PNG",
+    "GIF",
+    "Image",
+];
+
+/// Common cover art filenames (lowercase, checked in order of priority).
+/// Higher priority = more likely to be the actual cover art.
+const COVER_ART_PRIORITY_NAMES: &[&str] = &[
+    "cover.jpg", "cover.jpeg", "cover.png",
+    "folder.jpg", "folder.jpeg", "folder.png",
+    "front.jpg", "front.jpeg", "front.png",
+    "album.jpg", "album.jpeg", "album.png",
+    "artwork.jpg", "artwork.jpeg", "artwork.png",
+];
+
+/// Archive.org's auto-generated thumbnail filename.
+const IA_THUMB_FILENAME: &str = "__ia_thumb.jpg";
+
+/// Quality tier for audio files.
+/// Each tier gets its own directory CID for the Quality Ladder.
+///
+/// Preferred formats (in order):
+/// - Lossless (FLAC, WAV, etc.) - source of truth
+/// - Opus - modern transparent lossy, what we transcode to
+/// - MP3 320 CBR / V0 - legacy "perfect" lossy formats
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QualityTier {
+    /// Lossless: FLAC, WAV, AIFF, ALAC (the gold standard)
+    Lossless,
+    /// MP3 320 CBR - "Perfect" lossy CBR
+    Mp3_320,
+    /// MP3 V0 - "Perfect" lossy VBR (~245kbps average, LAME -V0)
+    Mp3V0,
+    /// MP3 256 CBR
+    Mp3_256,
+    /// MP3 V1/V2 and other VBR
+    Mp3Vbr,
+    /// MP3 192 CBR or lower quality CBR
+    Mp3_192,
+    /// AAC/M4A - patent-encumbered, only use if nothing else available
+    Aac,
+    /// Ogg Vorbis
+    OggVorbis,
+    /// Opus codec
+    Opus,
+}
+
+impl QualityTier {
+    /// Get the tier name for API responses.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QualityTier::Lossless => "lossless",
+            QualityTier::Mp3_320 => "mp3_320",
+            QualityTier::Mp3V0 => "mp3_v0",
+            QualityTier::Mp3_256 => "mp3_256",
+            QualityTier::Mp3Vbr => "mp3_vbr",
+            QualityTier::Mp3_192 => "mp3_192",
+            QualityTier::Aac => "aac",
+            QualityTier::OggVorbis => "ogg",
+            QualityTier::Opus => "opus",
+        }
+    }
+
+    /// Get the priority for selecting the "best" tier (higher = better).
+    /// Opus is the modern gold standard for lossy - transparent at ~128kbps.
+    pub fn priority(&self) -> u8 {
+        match self {
+            // Lossless is always the source of truth
+            QualityTier::Lossless => 100,
+            // Opus is THE modern lossy codec - what we transcode FLAC to
+            QualityTier::Opus => 95,
+            // High quality legacy lossy (don't re-encode, serve as-is)
+            QualityTier::Mp3_320 => 85,
+            QualityTier::Mp3V0 => 84,
+            // Other decent lossy
+            QualityTier::Mp3_256 => 75,
+            QualityTier::OggVorbis => 73,
+            QualityTier::Mp3Vbr => 65,     // V1, V2, etc.
+            // Lower quality fallbacks
+            QualityTier::Mp3_192 => 50,
+            // Patent-encumbered formats - only if nothing else available
+            QualityTier::Aac => 30,
+        }
+    }
+
+    /// Check if this tier is suitable as a "primary" format.
+    /// Lossless or high-quality lossy that shouldn't be transcoded further.
+    pub fn is_primary_quality(&self) -> bool {
+        matches!(self,
+            QualityTier::Lossless |
+            QualityTier::Opus |
+            QualityTier::Mp3_320 |
+            QualityTier::Mp3V0
+        )
+    }
+
+    /// Check if this is lossless (can be transcoded to Opus ladder).
+    pub fn is_lossless(&self) -> bool {
+        matches!(self, QualityTier::Lossless)
     }
 }
 
-/// Check if a file is a metadata file to include for attribution.
+/// Detect quality tier from Archive.org file metadata.
+fn detect_quality_tier(file: &ArchiveFileEntry) -> Option<QualityTier> {
+    let format = file.format.as_deref().unwrap_or("");
+    let name = file.name.to_lowercase();
+
+    // Skip files we don't want
+    if should_skip_file(file) {
+        return None;
+    }
+
+    // Lossless formats
+    if format.contains("FLAC") || name.ends_with(".flac") {
+        return Some(QualityTier::Lossless);
+    }
+    if format.contains("WAV") || name.ends_with(".wav") {
+        return Some(QualityTier::Lossless);
+    }
+    if format.contains("AIFF") || name.ends_with(".aiff") || name.ends_with(".aif") {
+        return Some(QualityTier::Lossless);
+    }
+    if format.contains("Apple Lossless") || format.contains("ALAC") {
+        return Some(QualityTier::Lossless);
+    }
+
+    // Ogg Vorbis
+    if format.contains("Ogg Vorbis") || name.ends_with(".ogg") {
+        return Some(QualityTier::OggVorbis);
+    }
+
+    // Opus
+    if format.contains("Opus") || name.ends_with(".opus") {
+        return Some(QualityTier::Opus);
+    }
+
+    // MP3 variants - detect based on what.cd hierarchy
+    if format.contains("MP3") || name.ends_with(".mp3") {
+        // Check for low-bitrate variants first (skip these entirely)
+        if name.contains("_64kb") || format.contains("64Kb") || format.contains("64kbps") {
+            return None; // Too low quality, skip
+        }
+
+        // VBR detection - check for V0 specifically
+        if format.contains("VBR") || name.contains("_vbr") {
+            // Try to detect V0 (~245kbps average) vs other VBR
+            if let Some(bitrate) = parse_bitrate_from_format(format) {
+                if bitrate >= 240 {
+                    return Some(QualityTier::Mp3V0); // V0 or equivalent
+                }
+            }
+            // Archive.org often just says "VBR MP3" without bitrate
+            return Some(QualityTier::Mp3Vbr);
+        }
+
+        // CBR detection from format string (e.g., "192Kbps MP3", "320Kbps MP3")
+        if let Some(bitrate) = parse_bitrate_from_format(format) {
+            if bitrate >= 320 {
+                return Some(QualityTier::Mp3_320);
+            } else if bitrate >= 256 {
+                return Some(QualityTier::Mp3_256);
+            } else if bitrate >= 192 {
+                return Some(QualityTier::Mp3_192);
+            } else if bitrate >= 128 {
+                return Some(QualityTier::Mp3_192); // 128-191 grouped with 192
+            } else {
+                return None; // Too low quality
+            }
+        }
+
+        // Default to 192 tier if we can't detect bitrate
+        return Some(QualityTier::Mp3_192);
+    }
+
+    // AAC/M4A
+    if format.contains("AAC") || format.contains("M4A") || name.ends_with(".m4a") || name.ends_with(".aac") {
+        return Some(QualityTier::Aac);
+    }
+
+    None
+}
+
+/// Parse bitrate from Archive.org format string (e.g., "192Kbps MP3" -> 192).
+fn parse_bitrate_from_format(format: &str) -> Option<u32> {
+    // Look for patterns like "192Kbps", "320kbps", "128 kbps"
+    let format_lower = format.to_lowercase();
+    for word in format_lower.split_whitespace() {
+        if let Some(kb_pos) = word.find("kb") {
+            if let Ok(bitrate) = word[..kb_pos].parse::<u32>() {
+                return Some(bitrate);
+            }
+        }
+    }
+    // Also try pattern without space: "192Kbps"
+    if let Some(captures) = format_lower.find("kbps").or_else(|| format_lower.find("kb")) {
+        let before = &format_lower[..captures];
+        if let Some(start) = before.rfind(|c: char| !c.is_ascii_digit()) {
+            if let Ok(bitrate) = before[start + 1..].parse::<u32>() {
+                return Some(bitrate);
+            }
+        } else if let Ok(bitrate) = before.parse::<u32>() {
+            return Some(bitrate);
+        }
+    }
+    None
+}
+
+/// Check if a file should be skipped entirely (not imported in any tier).
+fn should_skip_file(file: &ArchiveFileEntry) -> bool {
+    let name = file.name.to_lowercase();
+    let format = file.format.as_deref().unwrap_or("");
+
+    // Skip archive bundles
+    if name.ends_with(".zip") || name.ends_with(".tar") || name.ends_with(".gz") {
+        return true;
+    }
+
+    // Skip playlist files
+    if name.ends_with(".m3u") || name.ends_with(".m3u8") || name.ends_with(".pls") {
+        return true;
+    }
+
+    // Skip 64kbps variants (too low quality for modern use)
+    if name.contains("_64kb") || format.contains("64Kb") {
+        return true;
+    }
+
+    // Skip sample/preview files
+    if name.contains("_sample") || name.contains("_preview") {
+        return true;
+    }
+
+    false
+}
+
+/// Unescape backslash-escaped characters from Archive.org metadata.
+/// Archive.org sometimes escapes parentheses: "Cry Over You \(original mix\)"
+pub fn unescape_archive_metadata(s: &str) -> String {
+    s.replace("\\(", "(")
+        .replace("\\)", ")")
+        .replace("\\[", "[")
+        .replace("\\]", "]")
+        .replace("\\'", "'")
+        .replace("\\\"", "\"")
+}
+
+/// Cover art candidate info for admin review.
+#[derive(Debug, Clone, Serialize)]
+pub struct CoverCandidate {
+    /// Original filename from Archive.org
+    pub filename: String,
+    /// File size in bytes
+    pub size: u64,
+    /// Similarity score (0-100, higher = more likely to be cover art)
+    pub score: u32,
+}
+
+/// Check if a file is an audio file we want to import.
+/// Uses quality tier detection which also handles skip logic.
+fn is_audio_file(file: &ArchiveFileEntry) -> bool {
+    detect_quality_tier(file).is_some()
+}
+
+/// Check if a file is a metadata file to include for provenance.
+/// Only include _meta.xml - the authoritative Archive.org metadata.
+/// Skip _files.xml and _reviews.xml (not needed, can be re-fetched).
 fn is_metadata_file(file: &ArchiveFileEntry) -> bool {
     let name = file.name.to_lowercase();
 
-    // Include _meta.xml, _files.xml for provenance
-    if name.ends_with("_meta.xml") || name.ends_with("_files.xml") {
+    // Only include _meta.xml - the core Archive.org item metadata
+    if name.ends_with("_meta.xml") {
         return true;
     }
 
@@ -348,6 +587,142 @@ fn is_metadata_file(file: &ArchiveFileEntry) -> bool {
     } else {
         false
     }
+}
+
+/// Check if a file is an image file (potential cover art).
+fn is_image_file(file: &ArchiveFileEntry) -> bool {
+    let name = file.name.to_lowercase();
+
+    // Check by format first
+    if let Some(format) = &file.format {
+        if IMAGE_FORMATS.iter().any(|f| format.contains(f)) {
+            return true;
+        }
+    }
+
+    // Check by extension
+    name.ends_with(".jpg")
+        || name.ends_with(".jpeg")
+        || name.ends_with(".png")
+        || name.ends_with(".gif")
+}
+
+/// Score a cover art candidate based on filename and size.
+/// Higher score = more likely to be the actual cover art.
+fn score_cover_candidate(file: &ArchiveFileEntry) -> u32 {
+    let name_lower = file.name.to_lowercase();
+    let mut score = 0u32;
+
+    // Skip non-image files (meta.txt, etc.)
+    if !name_lower.ends_with(".jpg")
+        && !name_lower.ends_with(".jpeg")
+        && !name_lower.ends_with(".png")
+        && !name_lower.ends_with(".gif")
+    {
+        return 0;
+    }
+
+    // Skip derivative/generated files
+    // _thumb.jpg = Archive.org thumbnails
+    // _spectrogram = audio visualization
+    // _meta.txt = metadata files
+    if name_lower.contains("_thumb.")
+        || name_lower.contains("_spectrogram")
+        || name_lower.ends_with("_meta.txt")
+    {
+        return 0;
+    }
+
+    // Penalize size-named versions (prefer full-res originals)
+    // e.g., 2016mix_500px.jpg, cover_250px.jpg
+    let has_size_suffix = name_lower.contains("_500px")
+        || name_lower.contains("_250px")
+        || name_lower.contains("_300px")
+        || name_lower.contains("_150px")
+        || name_lower.contains("_100px")
+        || name_lower.contains("_thumb");
+
+    if has_size_suffix {
+        // Still include but with low score (might be only option)
+        score += 5;
+    } else {
+        // No size suffix = likely full resolution
+        score += 20;
+    }
+
+    // Skip itemimage (usually auto-generated derivative)
+    if name_lower.contains("_itemimage") {
+        return 5; // Very low priority
+    }
+
+    // Bonus for known cover art filenames
+    for (i, priority_name) in COVER_ART_PRIORITY_NAMES.iter().enumerate() {
+        if name_lower == *priority_name || name_lower.ends_with(&format!("/{}", priority_name)) {
+            // Higher bonus for earlier entries (more common names)
+            score += 50 - (i as u32 * 3);
+            break;
+        }
+    }
+
+    // Bonus for larger files (higher resolution)
+    if let Some(size_str) = &file.size {
+        if let Ok(size) = size_str.parse::<u64>() {
+            // Log scale bonus for size (100KB = 10pts, 1MB = 20pts, 10MB = 30pts)
+            let size_kb = size / 1024;
+            if size_kb > 0 {
+                score += ((size_kb as f64).log10() * 10.0) as u32;
+            }
+        }
+    }
+
+    // Small bonus for jpg/png over gif
+    if name_lower.ends_with(".jpg") || name_lower.ends_with(".jpeg") {
+        score += 5;
+    } else if name_lower.ends_with(".png") {
+        score += 3;
+    }
+
+    score
+}
+
+/// Find cover art candidates from Archive.org files.
+/// Returns sorted list (highest score first) with the IA thumbnail info if present.
+pub fn find_cover_candidates(files: &[ArchiveFileEntry]) -> (Option<&ArchiveFileEntry>, Vec<CoverCandidate>) {
+    let mut ia_thumb: Option<&ArchiveFileEntry> = None;
+    let mut candidates: Vec<CoverCandidate> = Vec::new();
+
+    for file in files {
+        if !is_image_file(file) {
+            continue;
+        }
+
+        let name_lower = file.name.to_lowercase();
+
+        // Find the IA thumbnail
+        if name_lower == IA_THUMB_FILENAME {
+            ia_thumb = Some(file);
+            continue; // Don't add thumb to candidates
+        }
+
+        let score = score_cover_candidate(file);
+        if score > 0 {
+            let size = file.size
+                .as_ref()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+
+            candidates.push(CoverCandidate {
+                filename: file.name.clone(),
+                size,
+                score,
+            });
+        }
+    }
+
+    // Sort by score descending
+    candidates.sort_by(|a, b| b.score.cmp(&a.score));
+
+    (ia_thumb, candidates)
 }
 
 /// Get MIME type from filename.
@@ -738,23 +1113,32 @@ where
     let directory: DirectoryResponse = directory_response.json().await?;
     let audio_count = track_metadata.len();
 
-    // Use ID3 tags first, fall back to Archive.org metadata
-    // Precedence: ID3 >> Archive.org (default, configurable at Review stage)
+    // Precedence: Archive.org item metadata > ID3 tags
     //
-    // For album title: ID3 album tag > Archive.org title
-    // For artist: ID3 artist tag > Archive.org creator
-    let final_title = audio_files.iter()
-        .find_map(|f| f.album.clone())  // First ID3 album tag
-        .or(album_title.clone());  // Then Archive.org title
+    // Archive.org's item-level metadata is curated and authoritative.
+    // ID3 tags from individual tracks are often inconsistent or wrong
+    // (e.g., one track might have "Remix by X" as album name).
+    //
+    // For title: Archive.org title > ID3 album tag
+    // For artist: Archive.org creator > ID3 artist tag
+    let final_title = album_title.clone()
+        .or_else(|| audio_files.iter().find_map(|f| f.album.clone()));
 
-    let final_artist = audio_files.iter()
-        .find_map(|f| f.artist.clone())  // First ID3 artist tag
-        .or(album_artist.clone());  // Then Archive.org creator
+    let final_artist = album_artist.clone()
+        .or_else(|| audio_files.iter().find_map(|f| f.artist.clone()));
 
     // Serialize license info to JSON for Flagship compatibility
     let license_json = license_info
         .as_ref()
         .and_then(|li| serde_json::to_string(li).ok());
+
+    // Sort track metadata by track number and serialize to Flagship format
+    track_metadata.sort_by_key(|t| t.track_number.unwrap_or(999));
+
+    let track_metadata_json = serialize_track_metadata(&track_metadata, final_artist.as_deref());
+
+    // Find cover art candidates
+    let (_, cover_candidates) = find_cover_candidates(&metadata.files);
 
     info!(
         identifier = %identifier,
@@ -763,6 +1147,7 @@ where
         title = ?final_title,
         artist = ?final_artist,
         license = ?license_info,
+        cover_candidates = cover_candidates.len(),
         "Import complete"
     );
 
@@ -771,12 +1156,61 @@ where
     Ok(JobResult::Import {
         files_imported: audio_count,
         directory_cid: directory.cid,
+        quality_tiers: std::collections::HashMap::new(), // TODO: populate with tier CIDs
         source: format!("archive.org:{}", identifier),
         title: final_title,
         artist: final_artist,
         date: album_date,
         license: license_json,
+        track_metadata: track_metadata_json,
+        thumbnail_cid: None, // Set by cover art processing in mod.rs
     })
+}
+
+/// Serialize track metadata to Flagship's JSON format.
+/// Format: [{"title": "...", "artist": "...", "duration": "3:45", "trackNumber": 1}, ...]
+fn serialize_track_metadata(tracks: &[TrackMetadata], album_artist: Option<&str>) -> Option<String> {
+    if tracks.is_empty() {
+        return None;
+    }
+
+    let flagship_tracks: Vec<serde_json::Value> = tracks
+        .iter()
+        .map(|t| {
+            let mut obj = serde_json::Map::new();
+
+            if let Some(title) = &t.title {
+                obj.insert("title".to_string(), serde_json::Value::String(title.clone()));
+            }
+
+            // Use track artist if different from album, otherwise use album artist
+            let artist = t.artist.as_deref().or(album_artist);
+            if let Some(a) = artist {
+                obj.insert("artist".to_string(), serde_json::Value::String(a.to_string()));
+            }
+
+            // Format duration as "M:SS" like Flagship expects
+            if let Some(secs) = t.duration {
+                let mins = (secs / 60.0) as u32;
+                let remaining_secs = (secs % 60.0) as u32;
+                obj.insert(
+                    "duration".to_string(),
+                    serde_json::Value::String(format!("{}:{:02}", mins, remaining_secs)),
+                );
+            }
+
+            if let Some(num) = t.track_number {
+                obj.insert(
+                    "trackNumber".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(num)),
+                );
+            }
+
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+
+    serde_json::to_string(&flagship_tracks).ok()
 }
 
 #[cfg(test)]
@@ -809,7 +1243,8 @@ mod tests {
     #[test]
     fn test_is_metadata_file() {
         assert!(is_metadata_file(&make_file("item_meta.xml", Some("Metadata"))));
-        assert!(is_metadata_file(&make_file("item_files.xml", Some("Text"))));
+        assert!(!is_metadata_file(&make_file("item_files.xml", Some("Text")))); // Skip _files.xml
+        assert!(!is_metadata_file(&make_file("item_reviews.xml", Some("Text")))); // Skip _reviews.xml
         assert!(!is_metadata_file(&make_file("track.mp3", Some("VBR MP3"))));
     }
 
