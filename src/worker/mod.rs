@@ -551,8 +551,11 @@ impl JobWorker {
         if let Some(cid) = thumbnail_cid {
             update.insert("thumbnailCID".to_string(), serde_json::Value::String(cid));
         }
+        // audioQuality goes inside the metadata object
         if let Some(quality) = audio_quality {
-            update.insert("audioQuality".to_string(), serde_json::to_value(quality).unwrap_or_default());
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("audioQuality".to_string(), serde_json::to_value(quality).unwrap_or_default());
+            update.insert("metadata".to_string(), serde_json::Value::Object(metadata));
         }
 
         if update.is_empty() {
