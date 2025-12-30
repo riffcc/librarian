@@ -322,21 +322,23 @@ impl LibrarianNode {
     }
 
     /// Delete a job permanently from the store.
-    pub fn delete_job(&mut self, id: &ContentId) -> Result<()> {
+    /// If force is false, only archived jobs can be deleted.
+    /// If force is true, any job can be deleted (for bulk cleanup).
+    pub fn delete_job(&mut self, id: &ContentId, force: bool) -> Result<()> {
         let job = self.store.get::<Job>(id)?
             .ok_or_else(|| NodeError::JobNotFound(id.clone()))?;
 
-        // Only allow deleting archived jobs
-        if !job.archived {
+        // Only allow deleting archived jobs unless force is set
+        if !force && !job.archived {
             return Err(NodeError::InvalidJobState(format!(
-                "Job {} must be archived before deletion",
+                "Job {} must be archived before deletion (use force=true to override)",
                 id
             )));
         }
 
         self.store.delete::<Job>(id)?;
 
-        info!(job_id = %id, "Deleted archived job");
+        info!(job_id = %id, force = force, "Deleted job");
 
         Ok(())
     }

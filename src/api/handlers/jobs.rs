@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -349,10 +349,21 @@ pub async fn archive_job(
     Ok(Json(JobResponse::from(&job)))
 }
 
-/// Delete a specific archived job.
+/// Query parameters for delete job.
+#[derive(Deserialize, Default)]
+pub struct DeleteJobQuery {
+    /// Force delete even if not archived.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Delete a specific job.
+/// By default, only archived jobs can be deleted.
+/// Use ?force=true to delete any job (for bulk cleanup).
 pub async fn delete_job(
     State(state): State<Arc<ApiState>>,
     Path(job_id): Path<String>,
+    Query(query): Query<DeleteJobQuery>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     // Parse hex job ID
     let id_bytes = hex::decode(&job_id)
@@ -368,7 +379,7 @@ pub async fn delete_job(
 
     {
         let mut node = state.node.write().await;
-        node.delete_job(&content_id)
+        node.delete_job(&content_id, query.force)
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     }
 
