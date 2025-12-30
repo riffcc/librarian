@@ -468,15 +468,17 @@ fn detect_quality_tier(file: &ArchiveFileEntry) -> Option<QualityTier> {
         return Some(QualityTier::Opus);
     }
 
-    // MP3 variants - detect based on what.cd hierarchy
+    // MP3 variants - detect based on format field (codec/bitrate), NOT filename
     if format.contains("MP3") || name.ends_with(".mp3") {
-        // Check for low-bitrate variants first (skip these entirely)
-        if name.contains("_64kb") || format.contains("64Kb") || format.contains("64kbps") {
-            return None; // Too low quality, skip
+        // Check for low-bitrate from format field (e.g., "64Kbps MP3")
+        if let Some(bitrate) = parse_bitrate_from_format(format) {
+            if bitrate < 96 {
+                return None; // Too low quality, skip
+            }
         }
 
-        // VBR detection - check for V0 specifically
-        if format.contains("VBR") || name.contains("_vbr") {
+        // VBR detection - from format field only
+        if format.contains("VBR") {
             // Try to detect V0 (~245kbps average) vs other VBR
             if let Some(bitrate) = parse_bitrate_from_format(format) {
                 if bitrate >= 240 {
@@ -502,7 +504,7 @@ fn detect_quality_tier(file: &ArchiveFileEntry) -> Option<QualityTier> {
             }
         }
 
-        // Default to 192 tier if we can't detect bitrate
+        // Default to 192 tier if we can't detect bitrate from format
         return Some(QualityTier::Mp3_192);
     }
 
@@ -1105,37 +1107,82 @@ where
     let total_files = audio_files.len() + metadata_files.len();
     on_progress(0.05, Some(format!("Found {} files, downloading in parallel", total_files)));
 
-    // 4. Group audio files by quality tier
-    let mut tier_files: HashMap<QualityTier, Vec<&ArchiveFileEntry>> = HashMap::new();
+    // 4. Group audio files by quality tier, DEDUPLICATING by track identity
+    // Track identity = track number (from tags) or title. NOT filename.
+    // When multiple files have the same track in the same tier, prefer derivatives.
+    let mut tier_files: HashMap<QualityTier, HashMap<String, &ArchiveFileEntry>> = HashMap::new();
+
     for file in &audio_files {
         if let Some(tier) = detect_quality_tier(file) {
-            tier_files.entry(tier).or_default().push(file);
+            // Track identity: use track number if available, else title, else filename stem
+            let track_id = file.track.clone()
+                .or_else(|| file.title.clone())
+                .unwrap_or_else(|| {
+                    // Fallback: extract base name without extension and suffixes
+                    let stem = file.name.rsplit('/').next().unwrap_or(&file.name);
+                    let stem = stem.split('.').next().unwrap_or(stem);
+                    // Remove common suffixes like _vbr, _64kb
+                    stem.trim_end_matches("_vbr")
+                        .trim_end_matches("_64kb")
+                        .trim_end_matches("_128kb")
+                        .trim_end_matches("_192kb")
+                        .to_string()
+                });
+
+            let tier_map = tier_files.entry(tier).or_default();
+
+            // If we already have this track in this tier, prefer derivative (smaller/optimized)
+            if let Some(existing) = tier_map.get(&track_id) {
+                let existing_is_derivative = existing.source.as_deref() == Some("derivative");
+                let new_is_derivative = file.source.as_deref() == Some("derivative");
+
+                // Prefer derivative over original
+                if new_is_derivative && !existing_is_derivative {
+                    debug!(
+                        tier = %tier.as_str(),
+                        track = %track_id,
+                        old_file = %existing.name,
+                        new_file = %file.name,
+                        "Replacing original with derivative"
+                    );
+                    tier_map.insert(track_id, file);
+                }
+                // Otherwise keep existing (first derivative wins, or first original if no derivatives)
+            } else {
+                tier_map.insert(track_id, file);
+            }
         }
     }
 
-    info!(
-        identifier = %identifier,
-        tiers = ?tier_files.keys().map(|t| t.as_str()).collect::<Vec<_>>(),
-        "Grouped files by quality tier"
-    );
+    // Log what we found
+    for (tier, tracks) in &tier_files {
+        info!(
+            identifier = %identifier,
+            tier = %tier.as_str(),
+            track_count = tracks.len(),
+            "Quality tier"
+        );
+    }
 
     // 5. Download and upload files IN PARALLEL
     // The buffer pool's semaphore limits concurrent downloads globally
     // So with --concurrent=8, we download up to 8 files at once across all jobs
 
-    // Prepare audio file tasks with tier info
-    let audio_tasks: Vec<_> = audio_files.iter().filter_map(|file| {
-        let tier = detect_quality_tier(file)?;
-        let track_num = parse_track_number(&file.track);
-        let nice_name = generate_track_filename(file, track_num);
-        let original_name = file.name.clone();
-        // Unescape Archive.org metadata (e.g., "\(" → "(")
-        let title = file.title.as_ref().map(|t| unescape_archive_metadata(t));
-        let artist = file.artist.as_ref().map(|a| unescape_archive_metadata(a));
-        let duration = parse_duration(&file.length);
+    // Prepare audio file tasks from deduplicated tier map
+    let audio_tasks: Vec<_> = tier_files.values()
+        .flat_map(|tracks| tracks.values())
+        .filter_map(|file| {
+            let tier = detect_quality_tier(file)?;
+            let track_num = parse_track_number(&file.track);
+            let nice_name = generate_track_filename(file, track_num);
+            let original_name = file.name.clone();
+            // Unescape Archive.org metadata (e.g., "\(" → "(")
+            let title = file.title.as_ref().map(|t| unescape_archive_metadata(t));
+            let artist = file.artist.as_ref().map(|a| unescape_archive_metadata(a));
+            let duration = parse_duration(&file.length);
 
-        Some((original_name, nice_name, track_num, title, artist, duration, false, Some(tier)))
-    }).collect();
+            Some((original_name, nice_name, track_num, title, artist, duration, false, Some(tier)))
+        }).collect();
 
     // Prepare metadata file tasks (no tier for metadata)
     let meta_tasks: Vec<_> = metadata_files.iter().map(|file| {
@@ -1615,5 +1662,169 @@ mod tests {
             unescape_archive_metadata("Normal Title (No Escapes)"),
             "Normal Title (No Escapes)"
         );
+    }
+
+    /// Helper to create a file with full metadata for deduplication tests
+    fn make_file_full(
+        name: &str,
+        format: Option<&str>,
+        source: Option<&str>,
+        track: Option<&str>,
+        title: Option<&str>,
+    ) -> ArchiveFileEntry {
+        ArchiveFileEntry {
+            name: name.to_string(),
+            format: format.map(String::from),
+            size: Some("1000000".to_string()),
+            source: source.map(String::from),
+            title: title.map(String::from),
+            artist: None,
+            album: None,
+            track: track.map(String::from),
+            length: None,
+            genre: None,
+        }
+    }
+
+    /// Test case for tou247 - Archive.org item with duplicate files per track
+    /// https://archive.org/details/tou247
+    ///
+    /// This item has 2 tracks ("The Piano Tune" and "Too Retro") but Archive.org
+    /// provides both original and derivative versions:
+    /// - tou247a.mp3 (original, "VBR MP3") - "The Piano Tune"
+    /// - tou247a_vbr.mp3 (derivative, "VBR MP3") - "The Piano Tune"
+    /// - tou247b.mp3 (original, "VBR MP3") - "Too Retro"
+    /// - tou247b_vbr.mp3 (derivative, "VBR MP3") - "Too Retro"
+    ///
+    /// We should deduplicate to 2 tracks per tier, preferring derivatives.
+    #[test]
+    fn test_tou247_track_deduplication() {
+        // Simulate the Archive.org file entries for tou247
+        let files = vec![
+            make_file_full("tou247a.mp3", Some("VBR MP3"), Some("original"), Some("1"), Some("The Piano Tune")),
+            make_file_full("tou247a_vbr.mp3", Some("VBR MP3"), Some("derivative"), Some("1"), Some("The Piano Tune")),
+            make_file_full("tou247b.mp3", Some("VBR MP3"), Some("original"), Some("2"), Some("Too Retro")),
+            make_file_full("tou247b_vbr.mp3", Some("VBR MP3"), Some("derivative"), Some("2"), Some("Too Retro")),
+        ];
+
+        // Run the deduplication logic
+        let mut tier_files: HashMap<QualityTier, HashMap<String, &ArchiveFileEntry>> = HashMap::new();
+
+        for file in &files {
+            if let Some(tier) = detect_quality_tier(file) {
+                // Track identity: use track number if available, else title, else filename stem
+                let track_id = file.track.clone()
+                    .or_else(|| file.title.clone())
+                    .unwrap_or_else(|| {
+                        let stem = file.name.rsplit('/').next().unwrap_or(&file.name);
+                        let stem = stem.split('.').next().unwrap_or(stem);
+                        stem.trim_end_matches("_vbr")
+                            .trim_end_matches("_64kb")
+                            .trim_end_matches("_128kb")
+                            .trim_end_matches("_192kb")
+                            .to_string()
+                    });
+
+                let tier_map = tier_files.entry(tier).or_default();
+
+                if let Some(existing) = tier_map.get(&track_id) {
+                    let existing_is_derivative = existing.source.as_deref() == Some("derivative");
+                    let new_is_derivative = file.source.as_deref() == Some("derivative");
+
+                    // Prefer derivative over original
+                    if new_is_derivative && !existing_is_derivative {
+                        tier_map.insert(track_id, file);
+                    }
+                } else {
+                    tier_map.insert(track_id, file);
+                }
+            }
+        }
+
+        // All files should be Mp3Vbr tier
+        assert_eq!(tier_files.len(), 1, "Should have exactly 1 quality tier");
+        assert!(tier_files.contains_key(&QualityTier::Mp3Vbr), "Should be Mp3Vbr tier");
+
+        // Should have 2 tracks (not 4!)
+        let vbr_tracks = tier_files.get(&QualityTier::Mp3Vbr).unwrap();
+        assert_eq!(vbr_tracks.len(), 2, "Should have exactly 2 tracks after deduplication");
+
+        // Both should be derivatives
+        for (track_id, file) in vbr_tracks {
+            assert_eq!(
+                file.source.as_deref(),
+                Some("derivative"),
+                "Track {} should be derivative, got {:?} (file: {})",
+                track_id, file.source, file.name
+            );
+        }
+
+        // Verify track identities
+        let track_ids: std::collections::HashSet<_> = vbr_tracks.keys().collect();
+        assert!(track_ids.contains(&"1".to_string()), "Should have track 1");
+        assert!(track_ids.contains(&"2".to_string()), "Should have track 2");
+    }
+
+    /// Test that tracks without tags still deduplicate by filename stem
+    #[test]
+    fn test_deduplication_fallback_to_filename() {
+        // Files without track tags - should deduplicate by filename stem
+        let files = vec![
+            make_file_full("track01.mp3", Some("VBR MP3"), Some("original"), None, None),
+            make_file_full("track01_vbr.mp3", Some("VBR MP3"), Some("derivative"), None, None),
+            make_file_full("track02.mp3", Some("VBR MP3"), Some("original"), None, None),
+            make_file_full("track02_vbr.mp3", Some("VBR MP3"), Some("derivative"), None, None),
+        ];
+
+        let mut tier_files: HashMap<QualityTier, HashMap<String, &ArchiveFileEntry>> = HashMap::new();
+
+        for file in &files {
+            if let Some(tier) = detect_quality_tier(file) {
+                let track_id = file.track.clone()
+                    .or_else(|| file.title.clone())
+                    .unwrap_or_else(|| {
+                        let stem = file.name.rsplit('/').next().unwrap_or(&file.name);
+                        let stem = stem.split('.').next().unwrap_or(stem);
+                        stem.trim_end_matches("_vbr")
+                            .trim_end_matches("_64kb")
+                            .trim_end_matches("_128kb")
+                            .trim_end_matches("_192kb")
+                            .to_string()
+                    });
+
+                let tier_map = tier_files.entry(tier).or_default();
+
+                if let Some(existing) = tier_map.get(&track_id) {
+                    let existing_is_derivative = existing.source.as_deref() == Some("derivative");
+                    let new_is_derivative = file.source.as_deref() == Some("derivative");
+
+                    if new_is_derivative && !existing_is_derivative {
+                        tier_map.insert(track_id, file);
+                    }
+                } else {
+                    tier_map.insert(track_id, file);
+                }
+            }
+        }
+
+        let vbr_tracks = tier_files.get(&QualityTier::Mp3Vbr).unwrap();
+        assert_eq!(vbr_tracks.len(), 2, "Should have 2 tracks after deduplication");
+
+        // Both should be derivatives (with _vbr suffix removed for matching)
+        for (_track_id, file) in vbr_tracks {
+            assert_eq!(file.source.as_deref(), Some("derivative"));
+        }
+    }
+
+    /// Test quality tier detection uses format field, not filename
+    #[test]
+    fn test_quality_tier_uses_format_not_filename() {
+        // File with _vbr in name but no VBR in format should NOT be classified as VBR
+        let file_cbr = make_file_full("track_vbr.mp3", Some("192Kbps MP3"), None, None, None);
+        assert_eq!(detect_quality_tier(&file_cbr), Some(QualityTier::Mp3_192));
+
+        // File without _vbr in name but WITH VBR in format SHOULD be classified as VBR
+        let file_vbr = make_file_full("track.mp3", Some("VBR MP3"), None, None, None);
+        assert_eq!(detect_quality_tier(&file_vbr), Some(QualityTier::Mp3Vbr));
     }
 }
