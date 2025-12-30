@@ -301,6 +301,61 @@ impl LibrarianNode {
         Ok(job)
     }
 
+    /// Archive a completed or failed job (hide from main queue view).
+    pub fn archive_job(&mut self, id: &ContentId) -> Result<Job> {
+        let mut job = self.store.get::<Job>(id)?
+            .ok_or_else(|| NodeError::JobNotFound(id.clone()))?;
+
+        if !job.can_archive() {
+            return Err(NodeError::InvalidJobState(format!(
+                "Job {} cannot be archived (status: {:?}, archived: {})",
+                id, job.status, job.archived
+            )));
+        }
+
+        job.archive();
+        self.store.put(&job)?;
+
+        info!(job_id = %id, "Archived job");
+
+        Ok(job)
+    }
+
+    /// Delete a job permanently from the store.
+    pub fn delete_job(&mut self, id: &ContentId) -> Result<()> {
+        let job = self.store.get::<Job>(id)?
+            .ok_or_else(|| NodeError::JobNotFound(id.clone()))?;
+
+        // Only allow deleting archived jobs
+        if !job.archived {
+            return Err(NodeError::InvalidJobState(format!(
+                "Job {} must be archived before deletion",
+                id
+            )));
+        }
+
+        self.store.delete::<Job>(id)?;
+
+        info!(job_id = %id, "Deleted archived job");
+
+        Ok(())
+    }
+
+    /// Delete all archived jobs.
+    pub fn delete_all_archived_jobs(&mut self) -> Result<usize> {
+        let jobs = self.store.list::<Job>()?;
+        let archived: Vec<_> = jobs.iter().filter(|j| j.archived).collect();
+        let count = archived.len();
+
+        for job in archived {
+            self.store.delete::<Job>(&job.id)?;
+        }
+
+        info!(count = count, "Deleted all archived jobs");
+
+        Ok(count)
+    }
+
     /// Get jobs assigned to this node that are ready to execute.
     pub fn my_pending_jobs(&self) -> Result<Vec<Job>> {
         let jobs = self.store.list::<Job>()?;
@@ -454,8 +509,12 @@ mod tests {
 
         // Complete job
         let completed = node.complete_job(&job.id, JobResult::Audit {
-            missing_formats: vec![],
-            source_quality: "flac".to_string(),
+            total_releases: 5,
+            releases_with_issues: 0,
+            audits: vec![],
+            issue_counts: std::collections::HashMap::new(),
+            source_quality: Some("flac".to_string()),
+            missing_formats: Some(vec![]),
         }).await.unwrap();
         assert_eq!(completed.status, JobStatus::Completed);
 

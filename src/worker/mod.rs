@@ -16,9 +16,12 @@
 //! - BufferPool semaphore throttles global concurrent file downloads
 //! - Zero latency, zero wasted CPU cycles
 
+pub mod analyze;
+pub mod audit;
 pub mod buffer;
 pub mod cover;
 pub mod import;
+pub mod metadata;
 pub mod release;
 pub mod source;
 
@@ -326,6 +329,7 @@ impl JobWorker {
             JobType::Audit => self.execute_audit(&job).await,
             JobType::Transcode => self.execute_transcode(&job).await,
             JobType::Migrate => self.execute_migrate(&job).await,
+            JobType::Analyze => self.execute_analyze(&job).await,
         };
 
         // Complete the job
@@ -388,6 +392,8 @@ impl JobWorker {
             ref date,
             ref track_metadata,
             ref mut thumbnail_cid,
+            ref audio_quality,
+            ref quality_tiers,
             ..
         } = result
         {
@@ -444,6 +450,8 @@ impl JobWorker {
                 license.as_deref(),
                 date.as_deref(),
                 track_metadata.as_deref(),
+                audio_quality.as_ref(),
+                Some(quality_tiers),
                 self.config.auth.as_ref(),
             )
             .await;
@@ -498,12 +506,47 @@ impl JobWorker {
         Ok(result)
     }
 
-    /// Execute an audit job (stub).
-    async fn execute_audit(&self, _job: &Job) -> anyhow::Result<JobResult> {
-        // TODO: Implement quality ladder audit
+    /// Execute an audit job - scans Citadel Lens for quality issues.
+    async fn execute_audit(&self, job: &Job) -> anyhow::Result<JobResult> {
+        let job_id_hex = hex::encode(job.id.as_bytes());
+
+        // Check if Lens URL is configured
+        let lens_url = match &self.config.lens_url {
+            Some(url) if !url.is_empty() => url.as_str(),
+            _ => {
+                warn!("No Citadel Lens URL configured - cannot run audit. Set LENS_URL env var.");
+                anyhow::bail!("No Citadel Lens URL configured");
+            }
+        };
+
+        info!(job_id = %job_id_hex, lens_url = %lens_url, "Starting audit of Citadel Lens releases");
+
+        // Run the audit
+        let (total_releases, releases_with_issues, audits, issue_counts) = audit::run_audit(
+            &self.state.http_client,
+            lens_url,
+            |progress, message| {
+                if let Some(msg) = message {
+                    debug!(job_id = %job_id_hex, progress = %progress, message = %msg, "Audit progress");
+                }
+            },
+        ).await?;
+
+        info!(
+            job_id = %job_id_hex,
+            total = total_releases,
+            with_issues = releases_with_issues,
+            "Audit complete"
+        );
+
         Ok(JobResult::Audit {
-            missing_formats: vec![],
-            source_quality: "unknown".to_string(),
+            total_releases,
+            releases_with_issues,
+            audits,
+            issue_counts,
+            // Legacy fields not used in new audits
+            source_quality: None,
+            missing_formats: None,
         })
     }
 
@@ -521,6 +564,64 @@ impl JobWorker {
             new_cid: "".to_string(),
             size: 0,
         })
+    }
+
+    /// Execute an analyze job - extracts metadata without re-uploading.
+    async fn execute_analyze(&self, job: &Job) -> anyhow::Result<JobResult> {
+        let (source, gateway, release_id) = match &job.target {
+            JobTarget::Source {
+                source,
+                gateway,
+                existing_release_id,
+            } => (
+                source.clone(),
+                gateway.clone(),
+                existing_release_id.clone().unwrap_or_default(),
+            ),
+            JobTarget::Release(id) => {
+                // For release target, we need to fetch the release to get its CID
+                if let Some(lens_url) = &self.config.lens_url {
+                    let release_url = format!(
+                        "{}/api/v1/releases/{}",
+                        lens_url.trim_end_matches('/'),
+                        id
+                    );
+                    match self.state.http_client.get(&release_url).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            let release: serde_json::Value = resp.json().await?;
+                            let cid = release
+                                .get("contentCID")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| anyhow::anyhow!("Release has no contentCID"))?;
+                            (cid.to_string(), None, id.clone())
+                        }
+                        _ => anyhow::bail!("Failed to fetch release {} from Citadel Lens", id),
+                    }
+                } else {
+                    anyhow::bail!("Analyze job with Release target requires Lens URL");
+                }
+            }
+            _ => anyhow::bail!("Analyze job requires Source or Release target"),
+        };
+
+        info!(source = %source, release_id = %release_id, "Analyzing content");
+
+        let job_id_hex = hex::encode(job.id.as_bytes());
+        let result = analyze::execute_analyze(
+            &self.state.http_client,
+            &source,
+            &release_id,
+            gateway.as_deref(),
+            self.config.lens_url.as_deref(),
+            |progress, message| {
+                if let Some(msg) = message {
+                    debug!(job_id = %job_id_hex, progress = %progress, message = %msg, "Analyze progress");
+                }
+            },
+        )
+        .await?;
+
+        Ok(result)
     }
 }
 

@@ -42,6 +42,9 @@ pub struct JobResponse {
 
     /// Retry count (0 = original attempt).
     pub retry_count: u64,
+
+    /// Whether the job has been archived.
+    pub archived: bool,
 }
 
 impl From<&Job> for JobResponse {
@@ -52,6 +55,7 @@ impl From<&Job> for JobResponse {
             JobType::Migrate => "migrate",
             JobType::Import => "import",
             JobType::SourceImport => "source_import",
+            JobType::Analyze => "analyze",
         };
 
         let target = match &job.target {
@@ -82,6 +86,7 @@ impl From<&Job> for JobResponse {
             executor,
             result,
             retry_count: job.retry_count,
+            archived: job.archived,
         }
     }
 }
@@ -272,6 +277,7 @@ pub async fn create_job(
         "migrate" => JobType::Migrate,
         "import" => JobType::Import,
         "source_import" => JobType::SourceImport,
+        "analyze" => JobType::Analyze,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -288,6 +294,12 @@ pub async fn create_job(
         JobTarget::Category(cat.to_string())
     } else if let Some(id) = request.target.strip_prefix("archive.org:") {
         JobTarget::ArchiveOrgItem(id.to_string())
+    } else if let Some(source) = request.target.strip_prefix("source:") {
+        JobTarget::Source {
+            source: source.to_string(),
+            gateway: None,
+            existing_release_id: None,
+        }
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -305,4 +317,76 @@ pub async fn create_job(
     state.notify_job(job.id.clone()).await;
 
     Ok(Json(JobResponse::from(&job)))
+}
+
+/// Archive a job (hide from main queue view).
+pub async fn archive_job(
+    State(state): State<Arc<ApiState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobResponse>, (StatusCode, String)> {
+    // Parse hex job ID
+    let id_bytes = hex::decode(&job_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID format".to_string()))?;
+
+    if id_bytes.len() != 32 {
+        return Err((StatusCode::BAD_REQUEST, "Job ID must be 32 bytes".to_string()));
+    }
+
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&id_bytes);
+    let content_id = ContentId::from_bytes(bytes);
+
+    let job = {
+        let mut node = state.node.write().await;
+        node.archive_job(&content_id)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    };
+
+    Ok(Json(JobResponse::from(&job)))
+}
+
+/// Delete a specific archived job.
+pub async fn delete_job(
+    State(state): State<Arc<ApiState>>,
+    Path(job_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Parse hex job ID
+    let id_bytes = hex::decode(&job_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID format".to_string()))?;
+
+    if id_bytes.len() != 32 {
+        return Err((StatusCode::BAD_REQUEST, "Job ID must be 32 bytes".to_string()));
+    }
+
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&id_bytes);
+    let content_id = ContentId::from_bytes(bytes);
+
+    {
+        let mut node = state.node.write().await;
+        node.delete_job(&content_id)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Response for clear archived jobs.
+#[derive(Serialize)]
+pub struct ClearArchivedResponse {
+    /// Number of jobs deleted.
+    pub deleted: usize,
+}
+
+/// Delete all archived jobs.
+pub async fn clear_archived_jobs(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ClearArchivedResponse>, (StatusCode, String)> {
+    let deleted = {
+        let mut node = state.node.write().await;
+        node.delete_all_archived_jobs()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    Ok(Json(ClearArchivedResponse { deleted }))
 }

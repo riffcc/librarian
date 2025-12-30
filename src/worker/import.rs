@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn, debug};
 
 use crate::auth::AuthCredentials;
-use crate::crdt::JobResult;
+use crate::crdt::{AudioQuality, JobResult};
 use super::buffer::BufferPool;
 use super::ArchiveRateLimiter;
 
@@ -32,7 +32,7 @@ const RETRY_BASE_DELAY_MS: u64 = 500;
 const MAX_RETRY_DELAY_MS: u64 = 600_000;
 
 /// File entry for directory manifest.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct DirectoryEntry {
     path: String,
     cid: String,
@@ -415,6 +415,21 @@ impl QualityTier {
     pub fn is_lossless(&self) -> bool {
         matches!(self, QualityTier::Lossless)
     }
+
+    /// Convert this tier to an AudioQuality struct for metadata storage.
+    pub fn to_audio_quality(&self) -> AudioQuality {
+        match self {
+            QualityTier::Lossless => AudioQuality::flac(),
+            QualityTier::Mp3_320 => AudioQuality::mp3(320),
+            QualityTier::Mp3V0 => AudioQuality::mp3_vbr(),
+            QualityTier::Mp3_256 => AudioQuality::mp3(256),
+            QualityTier::Mp3Vbr => AudioQuality::mp3_vbr(),
+            QualityTier::Mp3_192 => AudioQuality::mp3(192),
+            QualityTier::Aac => AudioQuality::aac(),
+            QualityTier::OggVorbis => AudioQuality::vorbis(),
+            QualityTier::Opus => AudioQuality::opus(None),
+        }
+    }
 }
 
 /// Detect quality tier from Archive.org file metadata.
@@ -583,6 +598,11 @@ fn is_audio_file(file: &ArchiveFileEntry) -> bool {
 /// Skip _files.xml and _reviews.xml (not needed, can be re-fetched).
 fn is_metadata_file(file: &ArchiveFileEntry) -> bool {
     let name = file.name.to_lowercase();
+
+    // Explicitly skip _files.xml and _reviews.xml - these can be re-fetched
+    if name.ends_with("_files.xml") || name.ends_with("_reviews.xml") {
+        return false;
+    }
 
     // Only include _meta.xml - the core Archive.org item metadata
     if name.ends_with("_meta.xml") {
@@ -755,8 +775,6 @@ fn mime_from_name(name: &str) -> Option<String> {
         Some("application/xml".to_string())
     } else if name.ends_with(".json") {
         Some("application/json".to_string())
-    } else if name.ends_with(".txt") {
-        Some("text/plain".to_string())
     } else {
         None
     }
@@ -836,16 +854,36 @@ async fn upload_file(
             return None;
         }
 
-        // 429 or 503 = rate limited, back off aggressively
-        if status.as_u16() == 429 || status.as_u16() == 503 {
+        // 429, 503, 401, 403 = likely rate limited, back off aggressively
+        // Archive.org sometimes returns 401/403 when rate limiting
+        if matches!(status.as_u16(), 429 | 503 | 401 | 403) {
             rate_limiter.report_rate_limit_error();
-            warn!(file = %file_name, status = %status, attempt = attempt, "Rate limited, backing off");
+            warn!(
+                file = %file_name,
+                status = %status,
+                url = %download_url,
+                attempt = attempt,
+                "Rate limited (or auth error), backing off"
+            );
             continue;
         }
 
         // Other client errors (4xx except 404, 429) = permanent failure
         if status.is_client_error() {
-            warn!(file = %file_name, status = %status, "Client error, skipping");
+            // Get response body for debugging (may contain error details)
+            let error_body = response.text().await.unwrap_or_default();
+            let body_preview = if error_body.len() > 200 {
+                format!("{}...", &error_body[..200])
+            } else {
+                error_body
+            };
+            warn!(
+                file = %file_name,
+                status = %status,
+                url = %download_url,
+                body = %body_preview,
+                "Client error (possibly rate limited), skipping"
+            );
             return None;
         }
 
@@ -1058,12 +1096,27 @@ where
     let total_files = audio_files.len() + metadata_files.len();
     on_progress(0.05, Some(format!("Found {} files, downloading in parallel", total_files)));
 
-    // 4. Download and upload files IN PARALLEL
+    // 4. Group audio files by quality tier
+    let mut tier_files: HashMap<QualityTier, Vec<&ArchiveFileEntry>> = HashMap::new();
+    for file in &audio_files {
+        if let Some(tier) = detect_quality_tier(file) {
+            tier_files.entry(tier).or_default().push(file);
+        }
+    }
+
+    info!(
+        identifier = %identifier,
+        tiers = ?tier_files.keys().map(|t| t.as_str()).collect::<Vec<_>>(),
+        "Grouped files by quality tier"
+    );
+
+    // 5. Download and upload files IN PARALLEL
     // The buffer pool's semaphore limits concurrent downloads globally
     // So with --concurrent=8, we download up to 8 files at once across all jobs
 
-    // Prepare audio file tasks
-    let audio_tasks: Vec<_> = audio_files.iter().map(|file| {
+    // Prepare audio file tasks with tier info
+    let audio_tasks: Vec<_> = audio_files.iter().filter_map(|file| {
+        let tier = detect_quality_tier(file)?;
         let track_num = parse_track_number(&file.track);
         let nice_name = generate_track_filename(file, track_num);
         let original_name = file.name.clone();
@@ -1071,10 +1124,10 @@ where
         let artist = file.artist.clone();
         let duration = parse_duration(&file.length);
 
-        (original_name, nice_name, track_num, title, artist, duration, false)
+        Some((original_name, nice_name, track_num, title, artist, duration, false, Some(tier)))
     }).collect();
 
-    // Prepare metadata file tasks
+    // Prepare metadata file tasks (no tier for metadata)
     let meta_tasks: Vec<_> = metadata_files.iter().map(|file| {
         let dest_name = if file.name.starts_with('_') {
             file.name.clone()
@@ -1083,7 +1136,7 @@ where
         };
         let original_name = file.name.clone();
 
-        (original_name, dest_name, None, None, None, None, true)
+        (original_name, dest_name, None, None, None, None, true, None::<QualityTier>)
     }).collect();
 
     // Combine all tasks
@@ -1093,7 +1146,7 @@ where
     // The buffer pool's acquire() naturally throttles to max_concurrent
     // The rate limiter ensures we're good citizens to Archive.org
     let results: Vec<_> = stream::iter(all_tasks)
-        .map(|(original_name, dest_name, track_num, title, artist, duration, is_meta)| {
+        .map(|(original_name, dest_name, track_num, title, artist, duration, is_meta, tier)| {
             let client = client.clone();
             let archivist_url = archivist_url.to_string();
             let identifier = identifier.to_string();
@@ -1113,18 +1166,20 @@ where
                     &rate_limiter,
                 ).await;
 
-                (result, dest_name, original_name, track_num, title, artist, duration, is_meta)
+                (result, dest_name, original_name, track_num, title, artist, duration, is_meta, tier)
             }
         })
         .buffer_unordered(buffer_pool.max_concurrent()) // Process up to max_concurrent at once
         .collect()
         .await;
 
-    // Collect results
+    // Collect results - organize by tier for separate directory CIDs
     let mut uploaded_entries: Vec<DirectoryEntry> = Vec::new();
     let mut track_metadata: Vec<TrackMetadata> = Vec::new();
+    let mut tier_entries: HashMap<QualityTier, Vec<DirectoryEntry>> = HashMap::new();
+    let mut metadata_entries: Vec<DirectoryEntry> = Vec::new();
 
-    for (result, dest_name, original_name, track_num, title, artist, duration, is_meta) in results {
+    for (result, dest_name, original_name, track_num, title, artist, duration, is_meta, tier) in results {
         if let Some((cid, size)) = result {
             let mimetype = if is_meta {
                 if original_name.ends_with(".xml") {
@@ -1138,12 +1193,20 @@ where
                 mime_from_name(&original_name)
             };
 
-            uploaded_entries.push(DirectoryEntry {
+            let entry = DirectoryEntry {
                 path: dest_name.clone(),
                 cid,
                 size,
                 mimetype,
-            });
+            };
+
+            if is_meta {
+                metadata_entries.push(entry.clone());
+            } else if let Some(t) = tier {
+                tier_entries.entry(t).or_default().push(entry.clone());
+            }
+
+            uploaded_entries.push(entry);
 
             if !is_meta {
                 track_metadata.push(TrackMetadata {
@@ -1221,6 +1284,67 @@ where
     let directory: DirectoryResponse = directory_response.json().await?;
     let audio_count = track_metadata.len();
 
+    // 6. Create separate directory CIDs for each quality tier
+    on_progress(0.94, Some("Creating quality tier manifests".to_string()));
+
+    let mut quality_tiers_map: HashMap<String, String> = HashMap::new();
+
+    for (tier, mut entries) in tier_entries {
+        // Sort entries by path (track order)
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+        // Include metadata files in each tier directory for provenance
+        let mut tier_entries_with_meta = entries.clone();
+        tier_entries_with_meta.extend(metadata_entries.clone());
+
+        let tier_request = serde_json::json!({
+            "entries": tier_entries_with_meta,
+        });
+
+        let mut tier_req = client.post(&directory_url).json(&tier_request);
+        if let Some(creds) = auth {
+            tier_req = tier_req
+                .header("X-Pubkey", &creds.pubkey)
+                .header("X-Timestamp", creds.timestamp.to_string())
+                .header("X-Signature", &creds.signature);
+        }
+
+        match tier_req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(tier_dir) = resp.json::<DirectoryResponse>().await {
+                    info!(
+                        tier = %tier.as_str(),
+                        cid = %tier_dir.cid,
+                        files = entries.len(),
+                        "Created tier directory"
+                    );
+                    quality_tiers_map.insert(tier.as_str().to_string(), tier_dir.cid);
+                }
+            }
+            Ok(resp) => {
+                warn!(
+                    tier = %tier.as_str(),
+                    status = %resp.status(),
+                    "Failed to create tier directory"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    tier = %tier.as_str(),
+                    error = %e,
+                    "Failed to create tier directory"
+                );
+            }
+        }
+    }
+
+    info!(
+        identifier = %identifier,
+        tiers = ?quality_tiers_map.keys().collect::<Vec<_>>(),
+        "Created {} quality tier directories",
+        quality_tiers_map.len()
+    );
+
     // Precedence: Archive.org item metadata > ID3 tags
     //
     // Archive.org's item-level metadata is curated and authoritative.
@@ -1248,6 +1372,11 @@ where
     // Find cover art candidates
     let (_, cover_candidates) = find_cover_candidates(&metadata.files);
 
+    // Determine primary audio quality from the best available tier
+    let primary_audio_quality = tier_files.keys()
+        .max_by_key(|t| t.priority())
+        .map(|t| t.to_audio_quality());
+
     info!(
         identifier = %identifier,
         cid = %directory.cid,
@@ -1256,6 +1385,7 @@ where
         artist = ?final_artist,
         license = ?license_info,
         cover_candidates = cover_candidates.len(),
+        audio_quality = ?primary_audio_quality,
         "Import complete"
     );
 
@@ -1264,7 +1394,7 @@ where
     Ok(JobResult::Import {
         files_imported: audio_count,
         directory_cid: directory.cid,
-        quality_tiers: std::collections::HashMap::new(), // TODO: populate with tier CIDs
+        quality_tiers: quality_tiers_map,
         source: format!("archive.org:{}", identifier),
         title: final_title,
         artist: final_artist,
@@ -1272,6 +1402,7 @@ where
         license: license_json,
         track_metadata: track_metadata_json,
         thumbnail_cid: None, // Set by cover art processing in mod.rs
+        audio_quality: primary_audio_quality,
     })
 }
 

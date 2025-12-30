@@ -13,9 +13,32 @@ use tracing::{debug, info, warn};
 use crate::auth::AuthCredentials;
 use crate::crdt::JobResult;
 use super::buffer::BufferPool;
+use super::metadata::{
+    extract_audio_metadata, extract_track_metadata, extract_embedded_cover,
+    generate_golden_filename, generate_golden_dirname, is_audio_file as is_audio_filename,
+    is_cover_image, TrackMetadata,
+};
+use super::cover::{process_cover_bytes, upload_processed_cover, CoverSource};
 
 /// Default IPFS gateway for CID resolution.
 pub const DEFAULT_IPFS_GATEWAY: &str = "https://cdn.riff.cc/ipfs/";
+
+/// Metadata gathered during directory import for standardized naming.
+#[derive(Debug, Default)]
+struct ImportMetadata {
+    /// Album artist (from audio tags or provided)
+    artist: Option<String>,
+    /// Album title (from audio tags or provided)
+    album: Option<String>,
+    /// Release year (from audio tags or provided)
+    year: Option<u32>,
+    /// Track metadata for each audio file (keyed by original filename)
+    tracks: Vec<(String, TrackMetadata)>,
+    /// Cover art CID if found and uploaded
+    cover_cid: Option<String>,
+    /// Fallback cover CID (JPG/PNG)
+    cover_fallback_cid: Option<String>,
+}
 
 /// Default Archivist gateway for CID resolution.
 pub const DEFAULT_ARCHIVIST_GATEWAY: &str = "https://archivist.riff.cc/api/archivist/v1/data/";
@@ -38,29 +61,6 @@ struct DirectoryResponse {
     _total_size: u64,
     #[serde(rename = "filesCount")]
     _files_count: usize,
-}
-
-/// IPFS directory listing from gateway.
-#[derive(Debug, Deserialize)]
-struct IpfsDirectoryListing {
-    #[serde(rename = "Objects")]
-    objects: Vec<IpfsObject>,
-}
-
-#[derive(Debug, Deserialize)]
-struct IpfsObject {
-    #[serde(rename = "Links")]
-    links: Vec<IpfsLink>,
-}
-
-#[derive(Debug, Deserialize)]
-struct IpfsLink {
-    #[serde(rename = "Name")]
-    name: String,
-    #[serde(rename = "Hash")]
-    hash: String,
-    #[serde(rename = "Size")]
-    size: u64,
 }
 
 /// Source type detection.
@@ -135,6 +135,77 @@ fn format_speed(bytes_per_sec: f64) -> String {
     } else {
         format!("{:.0} B/s", bytes_per_sec)
     }
+}
+
+/// Parse IPFS gateway HTML directory listing to extract file links.
+///
+/// The HTML structure for file entries is:
+/// ```html
+/// <a href="/ipfs/{base_cid}/{encoded_filename}">{filename}</a>
+/// ```
+///
+/// We need to match only links that start with `/ipfs/{base_cid}/` to avoid
+/// picking up external links, navigation, data URIs, or individual file CID links.
+fn parse_ipfs_html_directory(html: &str, base_cid: &str) -> Vec<(String, u64)> {
+    let mut files = Vec::new();
+
+    // Build the prefix pattern for this directory's file links
+    let dir_prefix = format!("/ipfs/{}/", base_cid);
+
+    // Simple parsing for <a href="...">text</a>
+    let mut pos = 0;
+    while let Some(href_start) = html[pos..].find("href=\"") {
+        let href_start = pos + href_start + 6;
+        if let Some(href_end) = html[href_start..].find('"') {
+            let href = &html[href_start..href_start + href_end];
+
+            // Only process links that are within this directory
+            if let Some(rest) = href.strip_prefix(&dir_prefix) {
+                // Extract just the filename part (before any query params)
+                let filename = rest.split('?').next().unwrap_or(rest);
+
+                // URL decode
+                let filename = urlencoding::decode(filename)
+                    .map(|s| s.into_owned())
+                    .unwrap_or_else(|_| filename.to_string());
+
+                // Skip empty filenames and navigation
+                if !filename.is_empty()
+                    && filename != ".."
+                    && filename != "."
+                    && !filename.starts_with('#')
+                {
+                    // Deduplicate - only add if not already present
+                    if !files.iter().any(|(name, _)| name == &filename) {
+                        files.push((filename, 0u64));
+                    }
+                }
+            }
+
+            pos = href_start + href_end;
+        } else {
+            break;
+        }
+    }
+
+    files
+}
+
+/// Check if response looks like HTML.
+fn is_html_response(content_type: Option<&str>, body_preview: &[u8]) -> bool {
+    if let Some(ct) = content_type {
+        if ct.contains("text/html") {
+            return true;
+        }
+    }
+    if body_preview.len() >= 15 {
+        let preview = String::from_utf8_lossy(&body_preview[..body_preview.len().min(500)]);
+        return preview.contains("<!DOCTYPE")
+            || preview.contains("<html")
+            || preview.contains("<HTML")
+            || preview.contains("Index of /ipfs");
+    }
+    false
 }
 
 /// Execute a source import job.
@@ -369,7 +440,22 @@ where
     })
 }
 
+/// File entry from directory listing (either from API or HTML parsing).
+struct FileEntry {
+    name: String,
+    /// For API listings, this is the actual CID. For HTML parsed, this is empty.
+    hash: Option<String>,
+    #[allow(dead_code)]
+    size: u64,
+}
+
 /// Try to import as a directory. Returns Some(result) if it was a directory, None otherwise.
+///
+/// Features:
+/// - Extracts metadata from audio files (artist, album, year, track info)
+/// - Renames audio files to standardized format: "01 - Track Title.ext"
+/// - Generates standardized directory name: "Artist - Album (Year)"
+/// - Detects and processes cover art from embedded tags or directory images
 async fn try_import_directory<F>(
     client: &Client,
     archivist_url: &str,
@@ -383,69 +469,167 @@ where
     F: FnMut(f32, Option<String>, Option<String>),
 {
     let gw = gateway.unwrap_or(DEFAULT_IPFS_GATEWAY);
+    let mut files: Option<Vec<FileEntry>> = None;
 
-    // Try to get directory listing via IPFS API
-    // Most gateways support /api/v0/ls for directory listing
-    let ls_url = format!(
-        "{}api/v0/ls?arg={}",
-        gw.trim_end_matches("ipfs/"),
-        cid
-    );
+    // Fetch directory URL and parse HTML listing
+    let dir_url = format!("{}{}", gw, cid);
+    debug!(url = %dir_url, "Fetching directory listing");
 
-    debug!(url = %ls_url, "Trying directory listing");
+    if let Ok(resp) = client.get(&dir_url).send().await {
+        if resp.status().is_success() {
+            let content_type: Option<String> = resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
 
-    let response = match client.post(&ls_url).send().await {
-        Ok(r) => r,
-        Err(_) => return Ok(None), // Not a directory or listing not supported
-    };
-
-    if !response.status().is_success() {
-        return Ok(None); // Not a directory
+            if let Ok(body) = resp.text().await {
+                if is_html_response(content_type.as_deref(), body.as_bytes()) {
+                    let html_files = parse_ipfs_html_directory(&body, cid);
+                    if !html_files.is_empty() {
+                        info!(count = html_files.len(), "Parsed HTML directory listing");
+                        files = Some(html_files.into_iter().map(|(name, size)| FileEntry {
+                            name,
+                            hash: None,
+                            size,
+                        }).collect());
+                    }
+                }
+            }
+        }
     }
 
-    let listing: IpfsDirectoryListing = match response.json().await {
-        Ok(l) => l,
-        Err(_) => return Ok(None), // Not a directory listing format
+    // No directory found
+    let files = match files {
+        Some(f) if !f.is_empty() => f,
+        _ => return Ok(None),
     };
 
-    let links = &listing.objects.first().map(|o| &o.links);
-    let links = match links {
-        Some(l) if !l.is_empty() => l,
-        _ => return Ok(None), // Empty or no links = single file
-    };
-
-    info!(cid = %cid, files = links.len(), "Importing directory");
+    info!(cid = %cid, files = files.len(), "Importing directory with metadata extraction");
     on_progress(
         0.05,
-        Some(format!("Importing {} files", links.len())),
+        Some(format!("Analyzing {} files", files.len())),
         None,
     );
 
-    // Upload each file individually
+    // Separate files into audio, images, and other
+    let audio_files: Vec<&FileEntry> = files.iter()
+        .filter(|f| is_audio_filename(&f.name))
+        .collect();
+    let cover_files: Vec<&FileEntry> = files.iter()
+        .filter(|f| is_cover_image(&f.name))
+        .collect();
+
+    debug!(
+        audio = audio_files.len(),
+        covers = cover_files.len(),
+        other = files.len() - audio_files.len() - cover_files.len(),
+        "Categorized files"
+    );
+
+    // Initialize metadata tracking
+    let mut import_meta = ImportMetadata::default();
     let mut entries: Vec<DirectoryEntry> = Vec::new();
-    let total_files = links.len();
+    let total_files = files.len();
     let mut total_size: u64 = 0;
 
-    for (i, link) in links.iter().enumerate() {
-        let file_progress = 0.05 + (0.85 * (i as f32 / total_files as f32));
+    // First pass: Download first audio file to extract album metadata
+    if let Some(first_audio) = audio_files.first() {
+        on_progress(0.08, Some("Extracting metadata from first audio file".to_string()), None);
+
+        let file_url = build_file_url(gw, cid, first_audio);
+        if let Some(bytes) = download_file_bytes(client, &file_url, &first_audio.name, buffer_pool).await {
+            // Extract album-level metadata
+            if let Some(album_meta) = extract_audio_metadata(&bytes, &first_audio.name) {
+                import_meta.artist = album_meta.artist.clone();
+                import_meta.album = album_meta.album.clone();
+                import_meta.year = album_meta.year;
+
+                info!(
+                    artist = ?import_meta.artist,
+                    album = ?import_meta.album,
+                    year = ?import_meta.year,
+                    "Extracted album metadata"
+                );
+            }
+
+            // Check for embedded cover art
+            if let Some(cover_art) = extract_embedded_cover(&bytes, &first_audio.name) {
+                debug!(
+                    mime = %cover_art.mime_type,
+                    size = cover_art.data.len(),
+                    "Found embedded cover art"
+                );
+
+                // Process and upload cover art
+                if let Some(processed) = process_cover_bytes(&cover_art.data, CoverSource::Embedded) {
+                    if let Some(result) = upload_processed_cover(
+                        client,
+                        archivist_url,
+                        &processed,
+                        Some(&cover_art.data),
+                        "cover",
+                        auth,
+                    ).await {
+                        import_meta.cover_cid = Some(result.main_cid);
+                        import_meta.cover_fallback_cid = Some(result.fallback_cid);
+                        info!("Uploaded embedded cover art");
+                    }
+                }
+            }
+        }
+    }
+
+    // If no embedded cover, check for cover images in directory
+    if import_meta.cover_cid.is_none() && !cover_files.is_empty() {
+        // Sort by cover score and pick best candidate
+        let mut scored_covers: Vec<_> = cover_files.iter()
+            .map(|f| (f, super::metadata::score_cover_filename(&f.name)))
+            .collect();
+        scored_covers.sort_by(|a, b| b.1.cmp(&a.1));
+
+        if let Some((best_cover, score)) = scored_covers.first() {
+            debug!(file = %best_cover.name, score = score, "Selected cover image from directory");
+
+            let file_url = build_file_url(gw, cid, best_cover);
+            if let Some(bytes) = download_file_bytes(client, &file_url, &best_cover.name, buffer_pool).await {
+                if let Some(processed) = process_cover_bytes(&bytes, CoverSource::DirectoryFile) {
+                    if let Some(result) = upload_processed_cover(
+                        client,
+                        archivist_url,
+                        &processed,
+                        Some(&bytes),
+                        "cover",
+                        auth,
+                    ).await {
+                        import_meta.cover_cid = Some(result.main_cid);
+                        import_meta.cover_fallback_cid = Some(result.fallback_cid);
+                        info!(file = %best_cover.name, "Uploaded directory cover art");
+                    }
+                }
+            }
+        }
+    }
+
+    // Second pass: Download all files, extract track metadata, and apply standardized naming
+    for (i, file) in files.iter().enumerate() {
+        let file_progress = 0.15 + (0.75 * (i as f32 / total_files as f32));
         on_progress(
             file_progress,
-            Some(format!("Uploading {}", &link.name)),
+            Some(format!("Processing {}", &file.name)),
             None,
         );
 
-        let file_url = format!("{}{}", gw, link.hash);
-
-        debug!(file = %link.name, hash = %link.hash, "Downloading file");
+        let file_url = build_file_url(gw, cid, file);
+        debug!(file = %file.name, url = %file_url, "Downloading file");
 
         let response = match client.get(&file_url).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                warn!(file = %link.name, status = %r.status(), "Failed to download, skipping");
+                warn!(file = %file.name, status = %r.status(), "Failed to download, skipping");
                 continue;
             }
             Err(e) => {
-                warn!(file = %link.name, error = %e, "Failed to download, skipping");
+                warn!(file = %file.name, error = %e, "Failed to download, skipping");
                 continue;
             }
         };
@@ -455,12 +639,10 @@ where
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
-            .or_else(|| mime_from_name(&link.name));
+            .or_else(|| mime_from_name(&file.name));
 
-        // Acquire buffer slot from pool
+        // Acquire buffer slot and download
         let mut slot = buffer_pool.acquire().await;
-
-        // Stream download into buffer
         let mut stream = response.bytes_stream();
         let mut download_failed = false;
 
@@ -468,13 +650,13 @@ where
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {
-                    warn!(file = %link.name, error = %e, "Download error, skipping");
+                    warn!(file = %file.name, error = %e, "Download error, skipping");
                     download_failed = true;
                     break;
                 }
             };
             if let Err(e) = slot.write_chunk(&chunk) {
-                warn!(file = %link.name, error = %e, "Buffer write error, skipping");
+                warn!(file = %file.name, error = %e, "Buffer write error, skipping");
                 download_failed = true;
                 break;
             }
@@ -487,23 +669,45 @@ where
         let size = slot.size();
         total_size += size;
 
-        // Read buffer into bytes
         let bytes = match slot.into_bytes() {
             Ok(b) => b,
             Err(e) => {
-                warn!(file = %link.name, error = %e, "Failed to read buffer, skipping");
+                warn!(file = %file.name, error = %e, "Failed to read buffer, skipping");
                 continue;
             }
         };
 
-        // Upload to Archivist
+        // Determine the output filename
+        let output_name = if is_audio_filename(&file.name) {
+            // Extract track metadata and generate standardized filename
+            let track_meta = extract_track_metadata(&bytes, &file.name);
+
+            if let Some(ref meta) = track_meta {
+                let title = meta.title.as_deref().unwrap_or(&file.name);
+                generate_golden_filename(meta.number, title, &file.name)
+            } else {
+                // No metadata - keep original name
+                file.name.clone()
+            }
+        } else {
+            // Non-audio files keep original names
+            file.name.clone()
+        };
+
+        debug!(
+            original = %file.name,
+            output = %output_name,
+            "Filename mapping"
+        );
+
+        // Upload to Archivist with the (possibly renamed) filename
         let upload_url = format!("{}/api/archivist/v1/data", archivist_url);
 
         let mut request = client
             .post(&upload_url)
             .header(
                 "Content-Disposition",
-                format!("attachment; filename=\"{}\"", link.name),
+                format!("attachment; filename=\"{}\"", output_name),
             )
             .body(bytes);
 
@@ -511,7 +715,6 @@ where
             request = request.header("Content-Type", ct);
         }
 
-        // Add auth headers for upload permission
         if let Some(creds) = auth {
             request = request
                 .header("X-Pubkey", &creds.pubkey)
@@ -529,7 +732,7 @@ where
                 } else {
                     format!("Request failed: {}", e)
                 };
-                warn!(file = %link.name, error = %error_msg, "Failed to upload, skipping");
+                warn!(file = %file.name, error = %error_msg, "Failed to upload, skipping");
                 continue;
             }
         };
@@ -542,16 +745,16 @@ where
             } else {
                 format!("HTTP {}: {}", status.as_u16(), error_body)
             };
-            warn!(file = %link.name, error = %error_msg, "Failed to upload, skipping");
+            warn!(file = %file.name, error = %error_msg, "Failed to upload, skipping");
             continue;
         }
 
         let file_cid = upload_response.text().await?.trim().to_string();
 
-        debug!(file = %link.name, cid = %file_cid, "Uploaded to Archivist");
+        debug!(file = %output_name, cid = %file_cid, "Uploaded to Archivist");
 
         entries.push(DirectoryEntry {
-            path: link.name.clone(),
+            path: output_name,
             cid: file_cid,
             size,
             mimetype: content_type,
@@ -569,13 +772,31 @@ where
 
     let directory_url = format!("{}/api/archivist/v1/directory", archivist_url);
 
-    let directory_request = serde_json::json!({
-        "entries": entries,
-    });
+    // Generate standardized directory name if we have metadata
+    let directory_name = if import_meta.album.is_some() {
+        Some(generate_golden_dirname(
+            import_meta.artist.as_deref(),
+            import_meta.album.as_deref().unwrap_or("Unknown Album"),
+            import_meta.year,
+        ))
+    } else {
+        None
+    };
+
+    let directory_request = if let Some(ref name) = directory_name {
+        info!(name = %name, "Using standardized directory name");
+        serde_json::json!({
+            "entries": entries,
+            "name": name,
+        })
+    } else {
+        serde_json::json!({
+            "entries": entries,
+        })
+    };
 
     let mut request = client.post(&directory_url).json(&directory_request);
 
-    // Add auth headers for directory creation
     if let Some(creds) = auth {
         request = request
             .header("X-Pubkey", &creds.pubkey)
@@ -614,6 +835,9 @@ where
         cid = %directory.cid,
         files = entries.len(),
         size = %format_bytes(total_size),
+        artist = ?import_meta.artist,
+        album = ?import_meta.album,
+        has_cover = import_meta.cover_cid.is_some(),
         "Directory import complete"
     );
 
@@ -625,6 +849,54 @@ where
         size: total_size,
         content_type: Some("inode/directory".to_string()),
     }))
+}
+
+/// Build URL for downloading a file from the directory.
+fn build_file_url(gateway: &str, cid: &str, file: &FileEntry) -> String {
+    if let Some(ref hash) = file.hash {
+        format!("{}{}", gateway, hash)
+    } else {
+        format!("{}{}/{}", gateway, cid, urlencoding::encode(&file.name))
+    }
+}
+
+/// Download a file and return its bytes. Returns None on failure.
+async fn download_file_bytes(
+    client: &Client,
+    url: &str,
+    filename: &str,
+    buffer_pool: &Arc<BufferPool>,
+) -> Option<Vec<u8>> {
+    let response = match client.get(url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            warn!(file = %filename, status = %r.status(), "Failed to download");
+            return None;
+        }
+        Err(e) => {
+            warn!(file = %filename, error = %e, "Failed to download");
+            return None;
+        }
+    };
+
+    let mut slot = buffer_pool.acquire().await;
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(file = %filename, error = %e, "Download error");
+                return None;
+            }
+        };
+        if let Err(e) = slot.write_chunk(&chunk) {
+            warn!(file = %filename, error = %e, "Buffer write error");
+            return None;
+        }
+    }
+
+    slot.into_bytes().ok().map(|b| b.to_vec())
 }
 
 /// Get MIME type from filename.
@@ -716,5 +988,60 @@ mod tests {
         assert_eq!(mime_from_name("video.mp4"), Some("video/mp4".to_string()));
         assert_eq!(mime_from_name("image.jpg"), Some("image/jpeg".to_string()));
         assert_eq!(mime_from_name("unknown.xyz"), None);
+    }
+
+    #[test]
+    fn test_parse_ipfs_html_directory() {
+        // Sample HTML from actual IPFS gateway (cdn.riff.cc)
+        let html = r#"
+        <div>
+            <a href="/ipfs/QmeyPnKAnnhhLbmPtSMu1uzDsxZjywHucyzztzpAWyv7wX/02%20-%20Go%20to%20Hell.mp3">02 - Go to Hell.mp3</a>
+        </div>
+        <div>
+            <a class="ipfs-hash" href="/ipfs/QmUKrPaJN8XsSZZ199GvPe1h89c7sARZsNDRxaqfSTM1ii">QmUK…M1ii</a>
+        </div>
+        <div>
+            <a href="/ipfs/QmeyPnKAnnhhLbmPtSMu1uzDsxZjywHucyzztzpAWyv7wX/03%20-%20Checkmate.mp3">03 - Checkmate.mp3</a>
+        </div>
+        <div>
+            <a href="https://ipfs.tech">IPFS Tech</a>
+        </div>
+        <div>
+            <a href="data:image/x-icon;base64,AAA...">favicon</a>
+        </div>
+        <div>
+            <a href="/ipfs/QmeyPnKAnnhhLbmPtSMu1uzDsxZjywHucyzztzpAWyv7wX/%5Bcover%5D%20Loudog%20-%20Kito.jpg">[cover] Loudog - Kito.jpg</a>
+        </div>
+        "#;
+
+        let base_cid = "QmeyPnKAnnhhLbmPtSMu1uzDsxZjywHucyzztzpAWyv7wX";
+        let files = parse_ipfs_html_directory(html, base_cid);
+
+        // Should find exactly 3 files in the directory (2 mp3s + 1 jpg)
+        assert_eq!(files.len(), 3);
+
+        // Check that we got the right files (decoded)
+        let filenames: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(filenames.contains(&"02 - Go to Hell.mp3"));
+        assert!(filenames.contains(&"03 - Checkmate.mp3"));
+        assert!(filenames.contains(&"[cover] Loudog - Kito.jpg"));
+
+        // Should NOT contain garbage
+        assert!(!filenames.iter().any(|f| f.contains("ipfs.tech")));
+        assert!(!filenames.iter().any(|f| f.contains("data:")));
+        assert!(!filenames.iter().any(|f| f.contains("QmUK")));
+    }
+
+    #[test]
+    fn test_parse_ipfs_html_directory_empty_on_non_matching() {
+        // HTML with no matching links (use ## for raw string to allow # in content)
+        let html = r##"
+        <a href="https://example.com/file.mp3">External</a>
+        <a href="/ipfs/OtherCid/file.mp3">Different CID</a>
+        <a href="#anchor">Anchor</a>
+        "##;
+
+        let files = parse_ipfs_html_directory(html, "QmTargetCid");
+        assert!(files.is_empty());
     }
 }

@@ -33,6 +33,10 @@ pub enum JobType {
 
     /// Import from URL or CID (IPFS/Archivist).
     SourceImport,
+
+    /// Analyze content to extract metadata (audio quality, track info).
+    /// Does NOT re-upload - just fetches, analyzes, and updates Citadel Lens.
+    Analyze,
 }
 
 /// Job status as a lattice - merge takes "most progressed".
@@ -84,13 +88,199 @@ pub enum JobTarget {
     },
 }
 
+/// Audio quality metadata matching Flagship's expected format.
+/// Used to display codec badges (FLAC, MP3 320, Opus, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioQuality {
+    /// Audio format: flac, mp3, aac, opus, vorbis, wav, other
+    pub format: String,
+    /// Bitrate in kbps (e.g., 320, 256, 192) - for lossy formats
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<u32>,
+    /// Sample rate in Hz (e.g., 44100, 48000, 96000)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    /// Bit depth (e.g., 16, 24, 32) - for lossless formats
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u32>,
+    /// Codec name if known (e.g., "LAME V0", "Opus", "FLAC")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+}
+
+impl AudioQuality {
+    /// Create FLAC quality (16-bit CD quality by default)
+    pub fn flac() -> Self {
+        Self {
+            format: "flac".to_string(),
+            bitrate: None,
+            sample_rate: Some(44100),
+            bit_depth: Some(16),
+            codec: Some("FLAC".to_string()),
+        }
+    }
+
+    /// Create 24-bit FLAC quality
+    pub fn flac_24() -> Self {
+        Self {
+            format: "flac".to_string(),
+            bitrate: None,
+            sample_rate: Some(44100),
+            bit_depth: Some(24),
+            codec: Some("FLAC".to_string()),
+        }
+    }
+
+    /// Create MP3 quality with specified bitrate
+    pub fn mp3(bitrate: u32) -> Self {
+        Self {
+            format: "mp3".to_string(),
+            bitrate: Some(bitrate),
+            sample_rate: None,
+            bit_depth: None,
+            codec: Some("MP3".to_string()),
+        }
+    }
+
+    /// Create MP3 VBR quality
+    pub fn mp3_vbr() -> Self {
+        Self {
+            format: "mp3".to_string(),
+            bitrate: Some(245), // V0 average
+            sample_rate: None,
+            bit_depth: None,
+            codec: Some("LAME VBR".to_string()),
+        }
+    }
+
+    /// Create Ogg Vorbis quality
+    pub fn vorbis() -> Self {
+        Self {
+            format: "vorbis".to_string(),
+            bitrate: None,
+            sample_rate: None,
+            bit_depth: None,
+            codec: Some("Vorbis".to_string()),
+        }
+    }
+
+    /// Create Opus quality with optional bitrate
+    pub fn opus(bitrate: Option<u32>) -> Self {
+        Self {
+            format: "opus".to_string(),
+            bitrate,
+            sample_rate: None,
+            bit_depth: None,
+            codec: Some("Opus".to_string()),
+        }
+    }
+
+    /// Create AAC quality
+    pub fn aac() -> Self {
+        Self {
+            format: "aac".to_string(),
+            bitrate: None,
+            sample_rate: None,
+            bit_depth: None,
+            codec: Some("AAC".to_string()),
+        }
+    }
+
+    /// Create WAV quality (lossless PCM)
+    pub fn wav() -> Self {
+        Self {
+            format: "wav".to_string(),
+            bitrate: None,
+            sample_rate: Some(44100),
+            bit_depth: Some(16),
+            codec: Some("PCM".to_string()),
+        }
+    }
+}
+
+/// Types of quality issues detected during audit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditIssue {
+    /// No audio quality metadata (format/codec/bitrate unknown)
+    MissingAudioQuality,
+    /// No license information
+    MissingLicense,
+    /// No source URL (and not marked as Unknown or Self)
+    MissingSource,
+    /// Has lossless but missing Opus encodes for quality ladder
+    MissingOpusEncodes,
+    /// Could have cover art but doesn't (detected in import)
+    MissingCoverArt,
+    /// Has embedded track art we're not showing
+    UnusedTrackArt,
+    /// Missing description
+    MissingDescription,
+    /// Missing release year
+    MissingYear,
+    /// Missing credits/attribution (and not public domain)
+    MissingCredits,
+    /// No actual audio files in content
+    NoAudioFiles,
+    /// Content is on IPFS but not on Archivist
+    NotOnArchivist,
+    /// Invalid or missing content CID
+    InvalidContentCid,
+    /// Has files but no track metadata
+    MissingTrackMetadata,
+    /// Archive.org source that could be re-fetched for better quality
+    CanRefetchFromArchive { identifier: String },
+}
+
+/// Audit result for a single release.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseAudit {
+    /// Release ID
+    pub release_id: String,
+    /// Release title
+    pub title: String,
+    /// Artist name
+    pub artist: Option<String>,
+    /// Detected source quality tier
+    pub source_quality: Option<String>,
+    /// Available quality tiers
+    pub available_tiers: Vec<String>,
+    /// Quality tiers missing from the ideal ladder
+    pub missing_tiers: Vec<String>,
+    /// List of detected issues
+    pub issues: Vec<AuditIssue>,
+    /// Archive.org identifier if applicable (for refetch)
+    pub archive_org_id: Option<String>,
+    /// Content CID
+    pub content_cid: Option<String>,
+}
+
 /// Result of a completed job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JobResult {
-    /// Audit completed - contains report.
+    /// Audit completed - contains detailed report per release.
     Audit {
-        missing_formats: Vec<String>,
-        source_quality: String,
+        /// Total releases audited
+        #[serde(default)]
+        total_releases: usize,
+        /// Releases with at least one issue
+        #[serde(default)]
+        releases_with_issues: usize,
+        /// Detailed audit results per release (only those with issues)
+        #[serde(default)]
+        audits: Vec<ReleaseAudit>,
+        /// Summary counts by issue type
+        #[serde(default)]
+        issue_counts: std::collections::HashMap<String, usize>,
+        // Legacy fields for backwards compatibility with old audit results
+        /// Legacy: source quality (single-release audit)
+        #[serde(default, skip_serializing)]
+        source_quality: Option<String>,
+        /// Legacy: missing formats (single-release audit)
+        #[serde(default, skip_serializing)]
+        missing_formats: Option<Vec<String>>,
     },
 
     /// Transcode completed - contains output CIDs.
@@ -133,6 +323,10 @@ pub enum JobResult {
         /// Cover art CID (WebP format, 85% quality).
         #[serde(default)]
         thumbnail_cid: Option<String>,
+        /// Audio quality metadata for the primary (highest quality) tier.
+        /// Used for displaying codec badges (FLAC, MP3 320, Opus, etc.)
+        #[serde(default)]
+        audio_quality: Option<AudioQuality>,
     },
 
     /// Source import completed - URL/CID imported to Archivist.
@@ -145,6 +339,18 @@ pub enum JobResult {
         size: u64,
         /// Content type if detected.
         content_type: Option<String>,
+    },
+
+    /// Analyze completed - metadata extracted and updated in Citadel Lens.
+    Analyze {
+        /// Release ID that was updated.
+        release_id: String,
+        /// Detected audio quality.
+        audio_quality: Option<AudioQuality>,
+        /// Number of tracks with metadata extracted.
+        tracks_found: usize,
+        /// Track metadata as JSON string.
+        track_metadata: Option<String>,
     },
 
     /// Job failed with error message.
@@ -235,6 +441,11 @@ pub struct Job {
     /// Higher retry_count takes precedence in merge, allowing status reset.
     #[serde(default)]
     pub retry_count: u64,
+
+    /// Whether the job has been archived (hidden from main queue view).
+    /// Archived jobs can still be viewed in history but don't clutter the active queue.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// Upload authorization credentials for Archivist.
@@ -278,6 +489,7 @@ impl Job {
             auth_signature: auth.signature,
             auth_timestamp: auth.timestamp,
             retry_count: 0,
+            archived: false,
         }
     }
 
@@ -340,6 +552,22 @@ impl Job {
     pub fn can_retry(&self) -> bool {
         matches!(self.status, JobStatus::Failed | JobStatus::Completed)
     }
+
+    /// Archive the job (hide from main queue view).
+    /// Can only archive completed or failed jobs.
+    pub fn archive(&mut self) -> bool {
+        if self.can_retry() {
+            self.archived = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if job can be archived.
+    pub fn can_archive(&self) -> bool {
+        self.can_retry() && !self.archived
+    }
 }
 
 impl TotalMerge for Job {
@@ -381,6 +609,9 @@ impl TotalMerge for Job {
         let auth_signature = self.auth_signature.clone().or_else(|| other.auth_signature.clone());
         let auth_timestamp = self.auth_timestamp.or(other.auth_timestamp);
 
+        // Archived: once archived, stays archived (monotonic OR)
+        let archived = self.archived || other.archived;
+
         Job {
             id: self.id.clone(),
             job_type: self.job_type.clone(),
@@ -393,6 +624,7 @@ impl TotalMerge for Job {
             auth_signature,
             auth_timestamp,
             retry_count,
+            archived,
         }
     }
 }
@@ -481,8 +713,12 @@ mod tests {
         let mut job2 = job1.clone();
 
         job1.complete(JobResult::Audit {
-            missing_formats: vec!["opus_128".to_string()],
-            source_quality: "flac".to_string(),
+            total_releases: 10,
+            releases_with_issues: 3,
+            audits: vec![],
+            issue_counts: std::collections::HashMap::new(),
+            source_quality: Some("flac".to_string()),
+            missing_formats: Some(vec!["opus_128".to_string()]),
         });
 
         let merged = job1.merge(&job2);

@@ -5,4 +5,7 @@
 
 pub mod job;
 
-pub use job::{Job, JobOp, JobResult, JobStatus, JobTarget, JobType, UploadAuth};
+pub use job::{
+    AudioQuality, AuditIssue, Job, JobOp, JobResult, JobStatus, JobTarget, JobType,
+    ReleaseAudit, UploadAuth,
+};

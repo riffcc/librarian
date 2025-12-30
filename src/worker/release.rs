@@ -6,6 +6,7 @@
 //! Metadata format matches Flagship's expected schema:
 //! - `metadata.author` - artist name
 //! - `metadata.trackMetadata` - JSON array of track info
+//! - `metadata.audioQuality` - quality badge info (format, bitrate, etc.)
 //! - `thumbnailCID` - cover art CID (WebP)
 
 use reqwest::Client;
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn, error};
 
 use crate::auth::Auth;
+use crate::crdt::AudioQuality;
 
 /// Request body for creating a release in Citadel Lens.
 /// Uses camelCase to match the API's expected format.
@@ -64,6 +66,8 @@ struct CreateReleaseError {
 /// * `license_json` - Optional license info as JSON string
 /// * `date` - Optional release date
 /// * `track_metadata` - Optional track metadata as JSON string
+/// * `audio_quality` - Optional audio quality metadata for codec badge
+/// * `quality_tiers` - Optional quality ladder mapping (tier name -> CID)
 /// * `auth` - Authentication credentials for signing
 ///
 /// # Returns
@@ -79,6 +83,8 @@ pub async fn create_release_in_lens(
     license_json: Option<&str>,
     date: Option<&str>,
     track_metadata: Option<&str>,
+    audio_quality: Option<&AudioQuality>,
+    quality_tiers: Option<&std::collections::HashMap<String, String>>,
     auth: &Auth,
 ) -> Result<String, String> {
     info!(
@@ -121,6 +127,22 @@ pub async fn create_release_in_lens(
     // Add date as releaseYear if provided (store full precision)
     if let Some(d) = date {
         metadata["releaseYear"] = serde_json::Value::String(d.to_string());
+    }
+
+    // Add audio quality metadata for codec badge display
+    if let Some(quality) = audio_quality {
+        if let Ok(quality_json) = serde_json::to_value(quality) {
+            metadata["audioQuality"] = quality_json;
+        }
+    }
+
+    // Add quality ladder (available tiers with their CIDs) for quality switching
+    if let Some(tiers) = quality_tiers {
+        if !tiers.is_empty() {
+            if let Ok(tiers_json) = serde_json::to_value(tiers) {
+                metadata["qualityLadder"] = tiers_json;
+            }
+        }
     }
 
     // Build the request body
@@ -207,6 +229,8 @@ pub async fn try_create_release(
     license_json: Option<&str>,
     date: Option<&str>,
     track_metadata: Option<&str>,
+    audio_quality: Option<&AudioQuality>,
+    quality_tiers: Option<&std::collections::HashMap<String, String>>,
     auth: Option<&Auth>,
 ) -> Option<String> {
     // Check if Lens URL is configured
@@ -247,6 +271,8 @@ pub async fn try_create_release(
         license_json,
         date,
         track_metadata,
+        audio_quality,
+        quality_tiers,
         auth,
     ).await {
         Ok(id) => Some(id),

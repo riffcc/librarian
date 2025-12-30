@@ -104,10 +104,13 @@ pub fn router(state: Arc<ApiState>) -> Router {
             "/api/v1/jobs",
             get(handlers::jobs::list_jobs).post(handlers::jobs::create_job),
         )
-        .route("/api/v1/jobs/:id", get(handlers::jobs::get_job))
+        // Note: /archived must come before /:id to avoid matching "archived" as an ID
+        .route("/api/v1/jobs/archived", delete(handlers::jobs::clear_archived_jobs))
+        .route("/api/v1/jobs/:id", get(handlers::jobs::get_job).delete(handlers::jobs::delete_job))
         .route("/api/v1/jobs/:id/start", post(handlers::jobs::start_job))
-        .route("/api/v1/jobs/:id/stop", delete(handlers::jobs::stop_job))
+        .route("/api/v1/jobs/:id/stop", post(handlers::jobs::stop_job))
         .route("/api/v1/jobs/:id/retry", post(handlers::jobs::retry_job))
+        .route("/api/v1/jobs/:id/archive", post(handlers::jobs::archive_job))
         // Imports (stub for now)
         .route(
             "/api/v1/imports",
