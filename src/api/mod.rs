@@ -12,7 +12,7 @@ pub mod handlers;
 use std::sync::Arc;
 
 use axum::{
-    routing::{get, post, delete},
+    routing::{get, post, delete, patch},
     Router,
 };
 use citadel_crdt::ContentId;
@@ -36,6 +36,12 @@ pub struct ApiState {
     /// Archivist base URL.
     pub archivist_url: String,
 
+    /// Citadel Lens URL (for release creation/updates).
+    pub lens_url: Option<String>,
+
+    /// Auth credentials for signed requests.
+    pub auth: Option<crate::auth::Auth>,
+
     /// HTTP client for proxying requests.
     pub http_client: reqwest::Client,
 
@@ -45,10 +51,18 @@ pub struct ApiState {
 
 impl ApiState {
     /// Create new API state with job notification channel.
-    pub fn new(node: LibrarianNode, archivist_url: String, job_tx: mpsc::Sender<JobNotification>) -> Self {
+    pub fn new(
+        node: LibrarianNode,
+        archivist_url: String,
+        lens_url: Option<String>,
+        auth: Option<crate::auth::Auth>,
+        job_tx: mpsc::Sender<JobNotification>,
+    ) -> Self {
         Self {
             node: Arc::new(RwLock::new(node)),
             archivist_url,
+            lens_url,
+            auth,
             http_client: reqwest::Client::new(),
             job_tx,
         }
@@ -126,6 +140,11 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route(
             "/api/v1/sources/import",
             post(handlers::sources::import_source),
+        )
+        // Releases (metadata updates)
+        .route(
+            "/api/v1/releases/:id/metadata",
+            patch(handlers::releases::update_metadata),
         )
         // Middleware
         .layer(cors)

@@ -226,7 +226,13 @@ async fn run_daemon(
     let (job_tx, job_rx) = create_job_channel();
 
     // Create API state with job notification sender
-    let state = Arc::new(ApiState::new(node, archivist_url.to_string(), job_tx));
+    let state = Arc::new(ApiState::new(
+        node,
+        archivist_url.to_string(),
+        lens_url.map(String::from),
+        auth.clone(),
+        job_tx,
+    ));
 
     // Configure buffer pool
     let buffer_config = worker::BufferPoolConfig {
