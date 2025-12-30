@@ -564,10 +564,11 @@ mod tests {
     #[test]
     fn test_sanitize_filename() {
         assert_eq!(sanitize_filename("Normal Title"), "Normal Title");
-        assert_eq!(sanitize_filename("Title: Subtitle"), "Title_ Subtitle");
-        assert_eq!(sanitize_filename("What?"), "What_");
-        assert_eq!(sanitize_filename("A/B\\C"), "A_B_C");
-        assert_eq!(sanitize_filename("Test <> \"quotes\""), "Test __ _quotes_");
+        // UNIX-style: only / and \0 are sanitized, other chars preserved
+        assert_eq!(sanitize_filename("Title: Subtitle"), "Title: Subtitle");
+        assert_eq!(sanitize_filename("What?"), "What?");
+        assert_eq!(sanitize_filename("A/B\\C"), "A_B\\C"); // Only / is replaced
+        assert_eq!(sanitize_filename("Test <> \"quotes\""), "Test <> \"quotes\"");
         // Unicode preserved
         assert_eq!(sanitize_filename("日本語タイトル"), "日本語タイトル");
         assert_eq!(sanitize_filename("Ñoño"), "Ñoño");
@@ -587,10 +588,10 @@ mod tests {
             generate_golden_filename(None, "No Number", "track.ogg"),
             "No Number.ogg"
         );
-        // Sanitization
+        // UNIX-style: colons and question marks preserved
         assert_eq!(
             generate_golden_filename(Some(3), "What: The Remix?", "song.mp3"),
-            "03 - What_ The Remix_.mp3"
+            "03 - What: The Remix?.mp3"
         );
     }
 
@@ -612,10 +613,10 @@ mod tests {
             generate_golden_dirname(None, "Album Only", None),
             "Album Only"
         );
-        // Sanitization
+        // UNIX-style: only slashes sanitized, colons preserved
         assert_eq!(
             generate_golden_dirname(Some("Artist: Name"), "Album/Title", Some(2023)),
-            "Artist_ Name - Album_Title (2023)"
+            "Artist: Name - Album_Title (2023)"
         );
     }
 
