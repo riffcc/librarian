@@ -11,7 +11,7 @@ use citadel_crdt::ContentId;
 use serde::{Deserialize, Serialize};
 
 use crate::api::ApiState;
-use crate::crdt::{Job, JobTarget, JobType};
+use crate::crdt::{Job, JobResult, JobTarget, JobType, ProvidedMetadata};
 
 /// Job response (serializable).
 #[derive(Serialize)]
@@ -148,6 +148,10 @@ pub struct CreateJobRequest {
     /// Pre-authorized public key for Archivist uploads.
     /// Format: "ed25519p/{hex}" as used by Citadel/Flagship.
     pub pubkey: Option<String>,
+
+    /// Existing release ID to update after job completion.
+    /// Used when fixing issues on existing releases.
+    pub existing_release_id: Option<String>,
 }
 
 /// Start job request (optional pubkey for authorization).
@@ -298,7 +302,7 @@ pub async fn create_job(
         JobTarget::Source {
             source: source.to_string(),
             gateway: None,
-            existing_release_id: None,
+            existing_release_id: request.existing_release_id.clone(),
         }
     } else {
         return Err((
@@ -389,4 +393,92 @@ pub async fn clear_archived_jobs(
     };
 
     Ok(Json(ClearArchivedResponse { deleted }))
+}
+
+/// Request to provide metadata for a NeedsInput job.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvideMetadataRequest {
+    /// Artist name (required)
+    pub artist: String,
+    /// Album title (required)
+    pub album: String,
+    /// Release year (optional)
+    pub year: Option<u32>,
+    /// Track titles for renaming (optional)
+    #[serde(default)]
+    pub track_titles: Vec<String>,
+    /// Cover art CID (optional)
+    pub cover_cid: Option<String>,
+}
+
+impl From<ProvideMetadataRequest> for ProvidedMetadata {
+    fn from(req: ProvideMetadataRequest) -> Self {
+        ProvidedMetadata {
+            artist: req.artist,
+            album: req.album,
+            year: req.year,
+            track_titles: req.track_titles,
+            cover_cid: req.cover_cid,
+        }
+    }
+}
+
+/// Provide metadata for a job that returned NeedsInput.
+/// This stores the metadata and restarts the job to complete the import.
+pub async fn provide_metadata(
+    State(state): State<Arc<ApiState>>,
+    Path(job_id): Path<String>,
+    Json(request): Json<ProvideMetadataRequest>,
+) -> Result<Json<JobResponse>, (StatusCode, String)> {
+    // Parse hex job ID
+    let id_bytes = hex::decode(&job_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID format".to_string()))?;
+
+    if id_bytes.len() != 32 {
+        return Err((StatusCode::BAD_REQUEST, "Job ID must be 32 bytes".to_string()));
+    }
+
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&id_bytes);
+    let content_id = ContentId::from_bytes(bytes);
+
+    // Get the job and verify it's in NeedsInput state
+    let job = {
+        let node = state.node.read().await;
+        node.get_job(&content_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?
+    };
+
+    // Check if job result is NeedsInput
+    match &job.result {
+        Some(JobResult::NeedsInput { .. }) => {
+            // Good - this is what we expect
+        }
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Job is not waiting for input".to_string(),
+            ));
+        }
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Job has no result - may still be running".to_string(),
+            ));
+        }
+    }
+
+    // Store the provided metadata and restart the job
+    let job = {
+        let mut node = state.node.write().await;
+        node.provide_job_metadata(&content_id, request.into())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    // Notify worker to execute the job with the new metadata
+    state.notify_job(content_id).await;
+
+    Ok(Json(JobResponse::from(&job)))
 }

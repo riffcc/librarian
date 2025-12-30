@@ -7,5 +7,5 @@ pub mod job;
 
 pub use job::{
     AudioQuality, AuditIssue, Job, JobOp, JobResult, JobStatus, JobTarget, JobType,
-    ReleaseAudit, UploadAuth,
+    MissingField, PartialMetadata, ProvidedMetadata, ReleaseAudit, UploadAuth,
 };

@@ -466,7 +466,7 @@ impl JobWorker {
 
     /// Execute a source import job (URL/CID).
     async fn execute_source_import(&self, job: &Job) -> anyhow::Result<JobResult> {
-        let (source, gateway, _existing_release_id) = match &job.target {
+        let (source, gateway, existing_release_id) = match &job.target {
             JobTarget::Source {
                 source,
                 gateway,
@@ -503,7 +503,108 @@ impl JobWorker {
         )
         .await?;
 
+        // Update existing release in Citadel Lens if specified
+        if let Some(release_id) = existing_release_id {
+            self.update_release_after_import(&release_id, &result).await;
+        }
+
         Ok(result)
+    }
+
+    /// Update an existing release in Citadel Lens after import.
+    async fn update_release_after_import(&self, release_id: &str, result: &JobResult) {
+        let lens_url = match &self.config.lens_url {
+            Some(url) => url,
+            None => {
+                warn!("No Lens URL configured - cannot update release {}", release_id);
+                return;
+            }
+        };
+
+        let auth = match &self.config.auth {
+            Some(a) => a,
+            None => {
+                warn!("No auth configured - cannot update release {}", release_id);
+                return;
+            }
+        };
+
+        // Extract CIDs from the job result
+        let (content_cid, thumbnail_cid, audio_quality) = match result {
+            JobResult::SourceImport { new_cid, thumbnail_cid, audio_quality, .. } => {
+                (Some(new_cid.clone()), thumbnail_cid.clone(), audio_quality.clone())
+            }
+            JobResult::Import { directory_cid, thumbnail_cid, audio_quality, .. } => {
+                (Some(directory_cid.clone()), thumbnail_cid.clone(), audio_quality.clone())
+            }
+            _ => {
+                warn!("Cannot update release from job result type");
+                return;
+            }
+        };
+
+        // Build update payload
+        let mut update = serde_json::Map::new();
+        if let Some(cid) = content_cid {
+            update.insert("contentCID".to_string(), serde_json::Value::String(cid));
+        }
+        if let Some(cid) = thumbnail_cid {
+            update.insert("thumbnailCID".to_string(), serde_json::Value::String(cid));
+        }
+        if let Some(quality) = audio_quality {
+            update.insert("audioQuality".to_string(), serde_json::to_value(quality).unwrap_or_default());
+        }
+
+        if update.is_empty() {
+            debug!(release_id = %release_id, "No updates to apply to release");
+            return;
+        }
+
+        let update_url = format!(
+            "{}/api/v1/releases/{}",
+            lens_url.trim_end_matches('/'),
+            release_id
+        );
+
+        info!(release_id = %release_id, updates = ?update.keys().collect::<Vec<_>>(), "Updating release in Citadel Lens");
+
+        // Sign the request body
+        let body = serde_json::to_string(&serde_json::Value::Object(update)).unwrap_or_default();
+        let timestamp = crate::auth::Auth::timestamp_millis();
+        let message = format!("{}:{}", timestamp, body);
+        let signature = auth.sign(message.as_bytes());
+
+        match self.state.http_client
+            .put(&update_url)
+            .header("Content-Type", "application/json")
+            .header("X-Public-Key", auth.public_key())
+            .header("X-Timestamp", timestamp.to_string())
+            .header("X-Signature", &signature)
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                info!(release_id = %release_id, "Successfully updated release in Citadel Lens");
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                warn!(
+                    release_id = %release_id,
+                    status = %status,
+                    body = %body,
+                    "Failed to update release in Citadel Lens"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    release_id = %release_id,
+                    error = %e,
+                    "Failed to update release in Citadel Lens"
+                );
+            }
+        }
     }
 
     /// Execute an audit job - scans Citadel Lens for quality issues.

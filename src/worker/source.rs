@@ -14,7 +14,7 @@ use crate::auth::AuthCredentials;
 use crate::crdt::JobResult;
 use super::buffer::BufferPool;
 use super::metadata::{
-    extract_audio_metadata, extract_track_metadata, extract_embedded_cover,
+    extract_audio_metadata, extract_audio_quality, extract_track_metadata, extract_embedded_cover,
     generate_golden_filename, generate_golden_dirname, is_audio_file as is_audio_filename,
     is_cover_image, TrackMetadata,
 };
@@ -38,6 +38,8 @@ struct ImportMetadata {
     cover_cid: Option<String>,
     /// Fallback cover CID (JPG/PNG)
     cover_fallback_cid: Option<String>,
+    /// Audio quality of the primary format
+    audio_quality: Option<crate::crdt::AudioQuality>,
 }
 
 /// Default Archivist gateway for CID resolution.
@@ -437,6 +439,8 @@ where
         new_cid,
         size,
         content_type,
+        thumbnail_cid: None,
+        audio_quality: None,
     })
 }
 
@@ -550,6 +554,18 @@ where
                     year = ?import_meta.year,
                     "Extracted album metadata"
                 );
+            }
+
+            // Extract audio quality
+            if let Some(quality) = extract_audio_quality(&bytes, &first_audio.name) {
+                info!(
+                    format = %quality.format,
+                    bitrate = ?quality.bitrate,
+                    sample_rate = ?quality.sample_rate,
+                    bit_depth = ?quality.bit_depth,
+                    "Extracted audio quality"
+                );
+                import_meta.audio_quality = Some(quality);
             }
 
             // Check for embedded cover art
@@ -848,6 +864,8 @@ where
         new_cid: directory.cid,
         size: total_size,
         content_type: Some("inode/directory".to_string()),
+        thumbnail_cid: import_meta.cover_cid,
+        audio_quality: import_meta.audio_quality,
     }))
 }
 

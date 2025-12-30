@@ -257,6 +257,72 @@ pub struct ReleaseAudit {
     pub content_cid: Option<String>,
 }
 
+// =============================================================================
+// NeedsInput Types - for interactive metadata collection
+// =============================================================================
+
+/// Fields that may be missing and need user input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingField {
+    /// Album artist name
+    Artist,
+    /// Album title
+    Album,
+    /// Release year
+    Year,
+    /// Track titles (for renaming)
+    TrackTitles,
+    /// Cover art
+    CoverArt,
+}
+
+/// Partial metadata detected during import - what we found before needing input.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialMetadata {
+    /// Detected artist (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    /// Detected album title (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    /// Detected year (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<u32>,
+    /// Number of audio tracks found
+    pub track_count: usize,
+    /// Detected audio format (e.g., "FLAC", "MP3 320")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_format: Option<String>,
+    /// Whether embedded cover art was found
+    pub has_embedded_cover: bool,
+    /// Whether directory cover art was found
+    pub has_directory_cover: bool,
+    /// Track titles we could extract (if any)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub track_titles: Vec<Option<String>>,
+}
+
+/// User-provided metadata to complete a NeedsInput job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvidedMetadata {
+    /// Artist name (required)
+    pub artist: String,
+    /// Album title (required)
+    pub album: String,
+    /// Release year (optional but recommended)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<u32>,
+    /// Track titles to use for renaming (optional)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub track_titles: Vec<String>,
+    /// Cover art CID to use (optional - user can upload one)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_cid: Option<String>,
+}
+
 /// Result of a completed job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JobResult {
@@ -339,6 +405,12 @@ pub enum JobResult {
         size: u64,
         /// Content type if detected.
         content_type: Option<String>,
+        /// Cover art CID (WebP format).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thumbnail_cid: Option<String>,
+        /// Audio quality metadata.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audio_quality: Option<AudioQuality>,
     },
 
     /// Analyze completed - metadata extracted and updated in Citadel Lens.
@@ -355,6 +427,23 @@ pub enum JobResult {
 
     /// Job failed with error message.
     Error(String),
+
+    /// Job needs user input to continue.
+    /// The job is paused and waiting for metadata to be provided via API.
+    NeedsInput {
+        /// Source that was being imported (URL, CID, etc.)
+        source: String,
+        /// Fields that are missing and need user input
+        missing_fields: Vec<MissingField>,
+        /// Partial metadata that was detected
+        detected: PartialMetadata,
+        /// Suggested Archive.org identifier if detectable from source
+        #[serde(skip_serializing_if = "Option::is_none")]
+        archive_org_hint: Option<String>,
+        /// Temporary CID of downloaded content (for resuming)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        temp_content_cid: Option<String>,
+    },
 }
 
 /// Output from a transcode operation.
@@ -446,6 +535,12 @@ pub struct Job {
     /// Archived jobs can still be viewed in history but don't clutter the active queue.
     #[serde(default)]
     pub archived: bool,
+
+    /// User-provided metadata for NeedsInput jobs.
+    /// When a job returns NeedsInput, the user provides metadata via API,
+    /// which is stored here and used when the job is retried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provided_metadata: Option<ProvidedMetadata>,
 }
 
 /// Upload authorization credentials for Archivist.
@@ -490,6 +585,7 @@ impl Job {
             auth_timestamp: auth.timestamp,
             retry_count: 0,
             archived: false,
+            provided_metadata: None,
         }
     }
 
@@ -612,6 +708,10 @@ impl TotalMerge for Job {
         // Archived: once archived, stays archived (monotonic OR)
         let archived = self.archived || other.archived;
 
+        // Provided metadata: use whichever has it (prefer self, then other)
+        let provided_metadata = self.provided_metadata.clone()
+            .or_else(|| other.provided_metadata.clone());
+
         Job {
             id: self.id.clone(),
             job_type: self.job_type.clone(),
@@ -625,6 +725,7 @@ impl TotalMerge for Job {
             auth_timestamp,
             retry_count,
             archived,
+            provided_metadata,
         }
     }
 }

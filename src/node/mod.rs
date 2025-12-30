@@ -356,6 +356,46 @@ impl LibrarianNode {
         Ok(count)
     }
 
+    /// Provide user metadata for a NeedsInput job and prepare it for retry.
+    pub fn provide_job_metadata(
+        &mut self,
+        id: &ContentId,
+        metadata: crate::crdt::ProvidedMetadata,
+    ) -> Result<Job> {
+        let mut job = self.store.get::<Job>(id)?
+            .ok_or_else(|| NodeError::JobNotFound(id.clone()))?;
+
+        // Verify job is in NeedsInput state
+        match &job.result {
+            Some(crate::crdt::JobResult::NeedsInput { .. }) => {
+                // Good - this is what we expect
+            }
+            _ => {
+                return Err(NodeError::InvalidJobState(format!(
+                    "Job {} is not waiting for input",
+                    id
+                )));
+            }
+        }
+
+        // Store the provided metadata
+        job.provided_metadata = Some(metadata.clone());
+
+        // Reset job for retry
+        job.retry();
+
+        self.store.put(&job)?;
+
+        info!(
+            job_id = %id,
+            artist = %metadata.artist,
+            album = %metadata.album,
+            "Stored user-provided metadata and reset job for retry"
+        );
+
+        Ok(job)
+    }
+
     /// Get jobs assigned to this node that are ready to execute.
     pub fn my_pending_jobs(&self) -> Result<Vec<Job>> {
         let jobs = self.store.list::<Job>()?;
