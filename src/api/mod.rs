@@ -18,7 +18,8 @@ use axum::{
 use citadel_crdt::ContentId;
 use tokio::sync::{mpsc, RwLock};
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{TraceLayer, DefaultOnRequest, DefaultOnResponse};
+use tracing::Level;
 
 use crate::node::LibrarianNode;
 
@@ -125,7 +126,18 @@ pub fn router(state: Arc<ApiState>) -> Router {
         )
         // Middleware
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        "request",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                    )
+                })
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO))
+        )
         .with_state(state)
 }
 

@@ -94,7 +94,10 @@ pub async fn list_jobs(
 
     let jobs = node
         .list_jobs()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to list jobs");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     let responses: Vec<JobResponse> = jobs.iter().map(JobResponse::from).collect();
 
