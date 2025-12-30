@@ -1173,6 +1173,44 @@ where
         );
     }
 
+    // Build a CROSS-TIER metadata lookup: track_id → (track_num, title, artist)
+    // Archive.org often has metadata on MP3 files but not on derivative Ogg/Opus files.
+    // This lets us fill in missing metadata from other tiers with the same track identity.
+    let mut track_metadata_lookup: HashMap<String, (Option<u32>, Option<String>, Option<String>)> = HashMap::new();
+    for file in &audio_files {
+        // Use same track identity logic as tier_files
+        let track_id = file.track.clone()
+            .or_else(|| file.title.clone())
+            .unwrap_or_else(|| {
+                let stem = file.name.rsplit('/').next().unwrap_or(&file.name);
+                let stem = stem.split('.').next().unwrap_or(stem);
+                stem.trim_end_matches("_vbr")
+                    .trim_end_matches("_64kb")
+                    .trim_end_matches("_128kb")
+                    .trim_end_matches("_192kb")
+                    .to_string()
+            });
+
+        let track_num = parse_track_number(&file.track);
+        let title = file.title.as_ref().map(|t| unescape_archive_metadata(t));
+        let artist = file.artist.as_ref().map(|a| unescape_archive_metadata(a));
+
+        // Only update the lookup if this file has metadata the current entry lacks
+        track_metadata_lookup.entry(track_id)
+            .and_modify(|(existing_num, existing_title, existing_artist)| {
+                if existing_num.is_none() && track_num.is_some() {
+                    *existing_num = track_num;
+                }
+                if existing_title.is_none() && title.is_some() {
+                    *existing_title = title.clone();
+                }
+                if existing_artist.is_none() && artist.is_some() {
+                    *existing_artist = artist.clone();
+                }
+            })
+            .or_insert((track_num, title, artist));
+    }
+
     // 5. Download and upload files IN PARALLEL
     // The buffer pool's semaphore limits concurrent downloads globally
     // So with --concurrent=8, we download up to 8 files at once across all jobs
@@ -1182,12 +1220,39 @@ where
         .flat_map(|tracks| tracks.values())
         .filter_map(|file| {
             let tier = detect_quality_tier(file)?;
-            let track_num = parse_track_number(&file.track);
+
+            // Compute track_id for cross-tier lookup (same logic as above)
+            let track_id = file.track.clone()
+                .or_else(|| file.title.clone())
+                .unwrap_or_else(|| {
+                    let stem = file.name.rsplit('/').next().unwrap_or(&file.name);
+                    let stem = stem.split('.').next().unwrap_or(stem);
+                    stem.trim_end_matches("_vbr")
+                        .trim_end_matches("_64kb")
+                        .trim_end_matches("_128kb")
+                        .trim_end_matches("_192kb")
+                        .to_string()
+                });
+
+            // Get this file's metadata
+            let file_track_num = parse_track_number(&file.track);
+            let file_title = file.title.as_ref().map(|t| unescape_archive_metadata(t));
+            let file_artist = file.artist.as_ref().map(|a| unescape_archive_metadata(a));
+
+            // Look up cross-tier metadata to fill in gaps
+            // This lets Ogg files inherit metadata from MP3 files with the same track identity
+            let (track_num, title, artist) = if let Some((lookup_num, lookup_title, lookup_artist)) = track_metadata_lookup.get(&track_id) {
+                (
+                    file_track_num.or(*lookup_num),
+                    file_title.or_else(|| lookup_title.clone()),
+                    file_artist.or_else(|| lookup_artist.clone()),
+                )
+            } else {
+                (file_track_num, file_title, file_artist)
+            };
+
             let nice_name = generate_track_filename(file, track_num);
             let original_name = file.name.clone();
-            // Unescape Archive.org metadata (e.g., "\(" → "(")
-            let title = file.title.as_ref().map(|t| unescape_archive_metadata(t));
-            let artist = file.artist.as_ref().map(|a| unescape_archive_metadata(a));
             let duration = parse_duration(&file.length);
 
             Some((original_name, nice_name, track_num, title, artist, duration, false, Some(tier)))
