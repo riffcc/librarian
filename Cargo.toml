@@ -53,6 +53,14 @@ urlencoding = "2"
 bytes = "1"
 tempfile = "3"
 
+# Image processing (cover art detection, WebP conversion)
+image = "0.25"
+image_hasher = "2"
+webp = "0.3"
+
+# Audio metadata analysis (bitrate detection, ID3, Vorbis comments)
+lofty = "0.22"
+
 # Utilities
 anyhow = "1"
 thiserror = "2"
