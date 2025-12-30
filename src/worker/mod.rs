@@ -23,21 +23,150 @@ pub mod release;
 pub mod source;
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-use governor::{Quota, RateLimiter, clock::SystemClock, state::{InMemoryState, direct::NotKeyed}, middleware::NoOpMiddleware};
-use std::num::NonZeroU32;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
-/// Type alias for Archive.org rate limiter (global, shared across all downloads)
-pub type ArchiveRateLimiter = Arc<RateLimiter<NotKeyed, InMemoryState, SystemClock, NoOpMiddleware<SystemTime>>>;
+/// Adaptive rate limiter for Archive.org API requests.
+///
+/// Starts at a conservative rate (15 req/min) and adjusts based on errors:
+/// - On success: gradually speeds up (up to 2x baseline)
+/// - On rate limit error: backs off exponentially
+/// - Shared globally across all jobs
+pub struct AdaptiveRateLimiter {
+    /// Base interval between requests (ms) - 15 req/min = 4000ms
+    base_interval_ms: u64,
+    /// Current interval between requests (ms) - adjusted dynamically
+    current_interval_ms: AtomicU64,
+    /// Minimum interval (fastest we'll ever go) - 2000ms = 30 req/min
+    min_interval_ms: u64,
+    /// Maximum interval (slowest, after many errors) - 60000ms = 1 req/min
+    max_interval_ms: u64,
+    /// Last request time
+    last_request: Mutex<Instant>,
+    /// Consecutive successes (for speed-up)
+    consecutive_successes: AtomicU64,
+    /// Consecutive errors (for backoff)
+    consecutive_errors: AtomicU64,
+}
 
-/// Create a rate limiter for Archive.org API requests.
-/// Default: 2 requests per second (conservative, Archive.org has undocumented limits)
-pub fn create_archive_rate_limiter(requests_per_second: u32) -> ArchiveRateLimiter {
-    let quota = Quota::per_second(NonZeroU32::new(requests_per_second).unwrap_or(NonZeroU32::new(2).unwrap()));
-    Arc::new(RateLimiter::direct_with_clock(quota, &SystemClock::default()))
+impl AdaptiveRateLimiter {
+    /// Create a new adaptive rate limiter.
+    ///
+    /// # Arguments
+    /// * `requests_per_minute` - Baseline requests per minute (default: 15)
+    pub fn new(requests_per_minute: u32) -> Arc<Self> {
+        let base_interval_ms = (60_000 / requests_per_minute.max(1)) as u64;
+
+        info!(
+            requests_per_minute = requests_per_minute,
+            base_interval_ms = base_interval_ms,
+            "Adaptive rate limiter initialized"
+        );
+
+        Arc::new(Self {
+            base_interval_ms,
+            current_interval_ms: AtomicU64::new(base_interval_ms),
+            min_interval_ms: base_interval_ms / 2, // Can speed up to 2x
+            max_interval_ms: 60_000, // Slowest: 1 req/min
+            last_request: Mutex::new(Instant::now() - Duration::from_secs(10)), // Allow immediate first request
+            consecutive_successes: AtomicU64::new(0),
+            consecutive_errors: AtomicU64::new(0),
+        })
+    }
+
+    /// Wait until we're allowed to make the next request.
+    pub async fn wait(&self) {
+        let mut last = self.last_request.lock().await;
+        let interval = Duration::from_millis(self.current_interval_ms.load(Ordering::Relaxed));
+        let elapsed = last.elapsed();
+
+        if elapsed < interval {
+            let wait_time = interval - elapsed;
+            debug!(
+                wait_ms = wait_time.as_millis(),
+                interval_ms = interval.as_millis(),
+                "Rate limiting: waiting before Archive.org request"
+            );
+            tokio::time::sleep(wait_time).await;
+        }
+
+        *last = Instant::now();
+    }
+
+    /// Report a successful request - may speed up the rate.
+    pub fn report_success(&self) {
+        self.consecutive_errors.store(0, Ordering::Relaxed);
+        let successes = self.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Speed up after 10 consecutive successes
+        if successes >= 10 && successes % 10 == 0 {
+            let current = self.current_interval_ms.load(Ordering::Relaxed);
+            let new_interval = (current * 9 / 10).max(self.min_interval_ms); // 10% faster
+
+            if new_interval < current {
+                self.current_interval_ms.store(new_interval, Ordering::Relaxed);
+                debug!(
+                    old_interval_ms = current,
+                    new_interval_ms = new_interval,
+                    successes = successes,
+                    "Rate limiter speeding up after successes"
+                );
+            }
+        }
+    }
+
+    /// Report a rate limit error - backs off exponentially.
+    pub fn report_rate_limit_error(&self) {
+        self.consecutive_successes.store(0, Ordering::Relaxed);
+        let errors = self.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let current = self.current_interval_ms.load(Ordering::Relaxed);
+        // Double the interval on each error, up to max
+        let new_interval = (current * 2).min(self.max_interval_ms);
+
+        self.current_interval_ms.store(new_interval, Ordering::Relaxed);
+
+        warn!(
+            old_interval_ms = current,
+            new_interval_ms = new_interval,
+            consecutive_errors = errors,
+            "Rate limiter backing off after rate limit error"
+        );
+    }
+
+    /// Report a transient error (not rate limiting) - slight backoff.
+    pub fn report_transient_error(&self) {
+        let current = self.current_interval_ms.load(Ordering::Relaxed);
+        // 25% slower on transient errors
+        let new_interval = (current * 5 / 4).min(self.max_interval_ms);
+
+        if new_interval > current {
+            self.current_interval_ms.store(new_interval, Ordering::Relaxed);
+            debug!(
+                old_interval_ms = current,
+                new_interval_ms = new_interval,
+                "Rate limiter slowing after transient error"
+            );
+        }
+    }
+
+    /// Get current requests per minute rate.
+    pub fn current_rate_per_minute(&self) -> f64 {
+        let interval_ms = self.current_interval_ms.load(Ordering::Relaxed);
+        60_000.0 / interval_ms as f64
+    }
+}
+
+/// Type alias for the adaptive rate limiter
+pub type ArchiveRateLimiter = Arc<AdaptiveRateLimiter>;
+
+/// Create an adaptive rate limiter for Archive.org API requests.
+/// Default: 15 requests per minute, adapts based on errors.
+pub fn create_archive_rate_limiter(requests_per_minute: u32) -> ArchiveRateLimiter {
+    AdaptiveRateLimiter::new(requests_per_minute)
 }
 
 use crate::api::{ApiState, JobNotification};
@@ -63,9 +192,9 @@ pub struct WorkerConfig {
     /// Buffer pool configuration.
     pub buffer: BufferPoolConfig,
 
-    /// Archive.org rate limit (requests per second).
-    /// Default: 2 (conservative to be good citizens)
-    pub archive_rate_limit: u32,
+    /// Archive.org rate limit (requests per minute).
+    /// Default: 15 (conservative baseline, adapts based on errors)
+    pub archive_requests_per_minute: u32,
 }
 
 impl Default for WorkerConfig {
@@ -75,7 +204,7 @@ impl Default for WorkerConfig {
             lens_url: None,
             auth: None,
             buffer: BufferPoolConfig::default(),
-            archive_rate_limit: 2, // 2 requests/sec to Archive.org
+            archive_requests_per_minute: 15, // 15 req/min baseline, adapts to errors
         }
     }
 }
@@ -87,7 +216,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("lens_url", &self.lens_url)
             .field("auth", &self.auth.as_ref().map(|a| a.public_key()))
             .field("buffer", &self.buffer)
-            .field("archive_rate_limit", &self.archive_rate_limit)
+            .field("archive_requests_per_minute", &self.archive_requests_per_minute)
             .finish()
     }
 }
@@ -113,10 +242,10 @@ impl JobWorker {
     /// Create a new job worker.
     pub fn new(state: Arc<ApiState>, config: WorkerConfig) -> Self {
         let buffer_pool = BufferPool::new(config.buffer.clone());
-        let archive_rate_limiter = create_archive_rate_limiter(config.archive_rate_limit);
+        let archive_rate_limiter = create_archive_rate_limiter(config.archive_requests_per_minute);
         info!(
-            rate_limit = config.archive_rate_limit,
-            "Archive.org rate limiter initialized"
+            requests_per_minute = config.archive_requests_per_minute,
+            "Archive.org adaptive rate limiter initialized"
         );
         Self { state, config, buffer_pool, archive_rate_limiter }
     }

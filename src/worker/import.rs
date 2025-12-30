@@ -814,14 +814,15 @@ async fn upload_file(
         }
         attempt += 1;
 
-        // Wait for rate limiter before making Archive.org request
-        rate_limiter.until_ready().await;
+        // Wait for adaptive rate limiter before making Archive.org request
+        rate_limiter.wait().await;
 
         debug!(file = %file_name, dest = %dest_name, attempt = attempt, "Downloading from Archive.org");
 
         let response = match client.get(&download_url).send().await {
             Ok(r) => r,
             Err(e) => {
+                rate_limiter.report_transient_error();
                 warn!(file = %file_name, error = %e, attempt = attempt, "Download connection error, will retry");
                 continue;
             }
@@ -835,14 +836,22 @@ async fn upload_file(
             return None;
         }
 
-        // Other client errors (4xx except 404) = permanent failure
+        // 429 or 503 = rate limited, back off aggressively
+        if status.as_u16() == 429 || status.as_u16() == 503 {
+            rate_limiter.report_rate_limit_error();
+            warn!(file = %file_name, status = %status, attempt = attempt, "Rate limited, backing off");
+            continue;
+        }
+
+        // Other client errors (4xx except 404, 429) = permanent failure
         if status.is_client_error() {
             warn!(file = %file_name, status = %status, "Client error, skipping");
             return None;
         }
 
-        // Server errors (5xx) = retry
+        // Server errors (5xx except 503) = retry with transient backoff
         if !status.is_success() {
+            rate_limiter.report_transient_error();
             warn!(file = %file_name, status = %status, attempt = attempt, "Server error, will retry");
             continue;
         }
@@ -887,6 +896,9 @@ async fn upload_file(
         let size = slot.size();
         let download_secs = download_start.elapsed().as_secs_f64();
         let speed_mbps = if download_secs > 0.0 { (size as f64 / 1024.0 / 1024.0) / download_secs } else { 0.0 };
+
+        // Report success to adaptive rate limiter (may speed up)
+        rate_limiter.report_success();
 
         info!(
             file = %file_name,
