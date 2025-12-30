@@ -23,6 +23,7 @@ use tracing::{info, warn, debug};
 use crate::auth::AuthCredentials;
 use crate::crdt::{AudioQuality, JobResult};
 use super::buffer::BufferPool;
+use super::metadata::{extract_track_metadata, is_audio_file as is_audio_file_name, TrackMetadata as LoftyTrackMetadata};
 use super::ArchiveRateLimiter;
 
 /// Base delay for exponential backoff (doubles each retry, caps at MAX_RETRY_DELAY)
@@ -798,7 +799,7 @@ async fn upload_file(
     auth: Option<&AuthCredentials>,
     buffer_pool: &std::sync::Arc<BufferPool>,
     rate_limiter: &ArchiveRateLimiter,
-) -> Option<(String, u64)> {
+) -> Option<(String, u64, Option<LoftyTrackMetadata>)> {
     let download_url = format!(
         "https://archive.org/download/{}/{}",
         identifier,
@@ -966,6 +967,14 @@ async fn upload_file(
             }
         };
 
+        // Detect audio tags from actual file content using lofty
+        // This fills in missing metadata when Archive.org doesn't provide it
+        let detected_tags = if is_audio_file_name(file_name) {
+            extract_track_metadata(&bytes, file_name)
+        } else {
+            None
+        };
+
         let upload_url = format!("{}/api/archivist/v1/data", archivist_url);
 
         // Retry upload forever
@@ -1035,7 +1044,7 @@ async fn upload_file(
             };
 
             info!(file = %file_name, cid = %cid, "Upload complete");
-            return Some((cid, size));
+            return Some((cid, size, detected_tags));
         }
     }
 }
@@ -1249,7 +1258,7 @@ where
     let mut metadata_entries: Vec<DirectoryEntry> = Vec::new();
 
     for (result, dest_name, original_name, track_num, title, artist, duration, is_meta, tier) in results {
-        if let Some((cid, size)) = result {
+        if let Some((cid, size, detected_tags)) = result {
             let mimetype = if is_meta {
                 if original_name.ends_with(".xml") {
                     Some("application/xml".to_string())
@@ -1281,10 +1290,15 @@ where
             // e.g., if we have Mp3_192, Mp3Vbr, and OggVorbis tiers, only use
             // the highest-priority tier's tracks for the track listing
             if !is_meta && tier == primary_tier {
+                // Use Archive.org metadata first, fall back to lofty-detected tags
+                let final_track_num = track_num.or_else(|| detected_tags.as_ref().and_then(|t| t.number));
+                let final_title = title.or_else(|| detected_tags.as_ref().and_then(|t| t.title.clone()));
+                let final_artist = artist.or_else(|| detected_tags.as_ref().and_then(|t| t.artist.clone()));
+
                 track_metadata.push(TrackMetadata {
-                    track_number: track_num,
-                    title,
-                    artist,
+                    track_number: final_track_num,
+                    title: final_title,
+                    artist: final_artist,
                     duration,
                     filename: dest_name,
                     original_filename: original_name,
