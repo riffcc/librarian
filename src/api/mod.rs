@@ -18,7 +18,7 @@ use axum::{
 use citadel_crdt::ContentId;
 use tokio::sync::{mpsc, RwLock};
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::{TraceLayer, DefaultOnRequest, DefaultOnResponse};
+use tower_http::trace::TraceLayer;
 use tracing::Level;
 
 use crate::node::LibrarianNode;
@@ -111,6 +111,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/jobs/:id/stop", post(handlers::jobs::stop_job))
         .route("/api/v1/jobs/:id/retry", post(handlers::jobs::retry_job))
         .route("/api/v1/jobs/:id/archive", post(handlers::jobs::archive_job))
+        .route("/api/v1/jobs/:id/metadata", post(handlers::jobs::provide_metadata))
         // Imports (stub for now)
         .route(
             "/api/v1/imports",
@@ -138,8 +139,18 @@ pub fn router(state: Arc<ApiState>) -> Router {
                         uri = %request.uri(),
                     )
                 })
-                .on_request(DefaultOnRequest::new().level(Level::INFO))
-                .on_response(DefaultOnResponse::new().level(Level::INFO))
+                // Only log requests/responses that are NOT 200 OK
+                .on_request(())
+                .on_response(|response: &axum::http::Response<_>, latency: std::time::Duration, _span: &tracing::Span| {
+                    let status = response.status();
+                    if !status.is_success() {
+                        tracing::warn!(
+                            status = %status,
+                            latency_ms = latency.as_millis(),
+                            "request failed"
+                        );
+                    }
+                })
         )
         .with_state(state)
 }
