@@ -15,6 +15,10 @@ pub struct NodeConfig {
 
     /// Optional seed for deterministic node ID (testing).
     pub node_id_seed: Option<u64>,
+
+    /// Auth public key bytes for stable node ID (production).
+    /// When set, node_id is derived from the auth keypair so it persists across restarts.
+    pub auth_pubkey_bytes: Option<[u8; 32]>,
 }
 
 impl NodeConfig {
@@ -28,16 +32,21 @@ impl NodeConfig {
                 Capability::Import,
             ],
             node_id_seed: None,
+            auth_pubkey_bytes: None,
         }
     }
 
     /// Generate or derive the node ID.
+    /// Priority: auth_pubkey_bytes > node_id_seed > random
     pub fn node_id(&self) -> U256 {
-        if let Some(seed) = self.node_id_seed {
+        if let Some(bytes) = &self.auth_pubkey_bytes {
+            // Stable ID from auth keypair - persists across restarts
+            U256::from_be_bytes(bytes)
+        } else if let Some(seed) = self.node_id_seed {
             // Deterministic ID for testing
             U256::from_u64(seed)
         } else {
-            // Generate random ID
+            // Generate random ID (not recommended for production)
             let mut bytes = [0u8; 32];
             getrandom::getrandom(&mut bytes).expect("Failed to generate random bytes");
             U256::from_be_bytes(&bytes)
@@ -53,6 +62,12 @@ impl NodeConfig {
     /// Set node ID seed (for testing).
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.node_id_seed = Some(seed);
+        self
+    }
+
+    /// Set auth public key for stable node ID.
+    pub fn with_auth_pubkey(mut self, bytes: [u8; 32]) -> Self {
+        self.auth_pubkey_bytes = Some(bytes);
         self
     }
 }

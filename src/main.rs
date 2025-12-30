@@ -183,9 +183,8 @@ async fn run_daemon(
 
     // Create node config
     let data_dir = data_dir.unwrap_or_else(auth::default_data_dir);
-    let config = NodeConfig::new(data_dir.clone());
 
-    // Try to load auth keypair
+    // Try to load auth keypair FIRST - we need it for stable node ID
     let keypair_path = auth::keypair_path(&data_dir);
     let auth = match Auth::load(&keypair_path) {
         Ok(auth) => {
@@ -205,6 +204,15 @@ async fn run_daemon(
             tracing::error!(error = %e, "Failed to load auth keypair");
             None
         }
+    };
+
+    // Configure node with auth pubkey for stable node ID
+    // This ensures node_id persists across restarts so jobs can resume
+    let config = if let Some(ref auth) = auth {
+        NodeConfig::new(data_dir.clone())
+            .with_auth_pubkey(auth.public_key_bytes())
+    } else {
+        NodeConfig::new(data_dir.clone())
     };
 
     // Initialize node

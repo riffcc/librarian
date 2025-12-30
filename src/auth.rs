@@ -100,6 +100,12 @@ impl Auth {
         format!("ed25519p/{}", hex::encode(verifying_key.to_bytes()))
     }
 
+    /// Get the raw public key bytes (32 bytes).
+    /// Useful for deriving a stable node ID.
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
     /// Create authentication credentials for an upload request.
     ///
     /// Signs the message "{timestamp}:UPLOAD" as expected by Archivist.
