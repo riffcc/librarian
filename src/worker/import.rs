@@ -1230,6 +1230,18 @@ where
         .collect()
         .await;
 
+    // Determine the primary (best) tier for track metadata
+    // We only want track metadata from ONE tier, not duplicated across all tiers
+    let primary_tier = tier_files.keys()
+        .max_by_key(|t| t.priority())
+        .copied();
+
+    debug!(
+        primary_tier = ?primary_tier.map(|t| t.as_str()),
+        all_tiers = ?tier_files.keys().map(|t| t.as_str()).collect::<Vec<_>>(),
+        "Selected primary tier for track metadata"
+    );
+
     // Collect results - organize by tier for separate directory CIDs
     let mut uploaded_entries: Vec<DirectoryEntry> = Vec::new();
     let mut track_metadata: Vec<TrackMetadata> = Vec::new();
@@ -1265,7 +1277,10 @@ where
 
             uploaded_entries.push(entry);
 
-            if !is_meta {
+            // Only add track metadata from the PRIMARY tier to avoid duplicates
+            // e.g., if we have Mp3_192, Mp3Vbr, and OggVorbis tiers, only use
+            // the highest-priority tier's tracks for the track listing
+            if !is_meta && tier == primary_tier {
                 track_metadata.push(TrackMetadata {
                     track_number: track_num,
                     title,
