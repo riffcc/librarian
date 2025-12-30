@@ -234,6 +234,7 @@ async fn run_daemon(
         lens_url: lens_url.map(String::from),
         auth,
         buffer: buffer_config,
+        archive_rate_limit: 2, // 2 requests/sec to Archive.org - be a good citizen
     };
     let _worker_handle = worker::spawn_worker(state.clone(), worker_config, job_rx);
     tracing::info!("Job worker started (event-driven)");

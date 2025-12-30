@@ -11,16 +11,25 @@
 //! - Per-track titles for nice file naming ("01 - Track Name.mp3")
 //! - License information for automatic categorization
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 use crate::auth::AuthCredentials;
 use crate::crdt::JobResult;
 use super::buffer::BufferPool;
+use super::ArchiveRateLimiter;
+
+/// Base delay for exponential backoff (doubles each retry, caps at MAX_RETRY_DELAY)
+const RETRY_BASE_DELAY_MS: u64 = 500;
+
+/// Maximum delay between retries (10 minutes)
+const MAX_RETRY_DELAY_MS: u64 = 600_000;
 
 /// File entry for directory manifest.
 #[derive(Debug, Serialize)]
@@ -754,7 +763,10 @@ fn mime_from_name(name: &str) -> Option<String> {
 }
 
 /// Download and upload a single file to Archivist.
-/// Returns (cid, size) on success.
+/// Returns (cid, size) on success, None only if file is 404 (not found).
+///
+/// Uses rate limiter for Archive.org requests and retries FOREVER with
+/// exponential backoff for transient errors. Only gives up on 404.
 async fn upload_file(
     client: &Client,
     archivist_url: &str,
@@ -763,131 +775,210 @@ async fn upload_file(
     dest_name: &str,
     auth: Option<&AuthCredentials>,
     buffer_pool: &std::sync::Arc<BufferPool>,
+    rate_limiter: &ArchiveRateLimiter,
 ) -> Option<(String, u64)> {
-    info!(file = %file_name, dest = %dest_name, "Downloading from Archive.org");
-
     let download_url = format!(
         "https://archive.org/download/{}/{}",
         identifier,
         urlencoding::encode(file_name)
     );
 
-    let response = match client.get(&download_url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(file = %file_name, error = %e, "Failed to download, skipping");
+    // Retry loop - continues forever until success or 404
+    let mut attempt: u32 = 0;
+    loop {
+        if attempt > 0 {
+            // Exponential backoff with cap at MAX_RETRY_DELAY
+            let delay_ms = std::cmp::min(
+                RETRY_BASE_DELAY_MS * (1u64 << std::cmp::min(attempt - 1, 10)),
+                MAX_RETRY_DELAY_MS,
+            );
+            let delay = Duration::from_millis(delay_ms);
+
+            if attempt % 5 == 0 {
+                // Log every 5th retry at warn level
+                warn!(
+                    file = %file_name,
+                    attempt = attempt,
+                    delay_secs = delay.as_secs(),
+                    "Still retrying download..."
+                );
+            } else {
+                debug!(
+                    file = %file_name,
+                    attempt = attempt,
+                    delay_ms = delay_ms,
+                    "Retrying download"
+                );
+            }
+            tokio::time::sleep(delay).await;
+        }
+        attempt += 1;
+
+        // Wait for rate limiter before making Archive.org request
+        rate_limiter.until_ready().await;
+
+        debug!(file = %file_name, dest = %dest_name, attempt = attempt, "Downloading from Archive.org");
+
+        let response = match client.get(&download_url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(file = %file_name, error = %e, attempt = attempt, "Download connection error, will retry");
+                continue;
+            }
+        };
+
+        let status = response.status();
+
+        // 404 = file doesn't exist, give up
+        if status.as_u16() == 404 {
+            warn!(file = %file_name, "File not found (404), skipping");
             return None;
         }
-    };
 
-    if !response.status().is_success() {
-        warn!(file = %file_name, status = %response.status(), "Failed to download, skipping");
-        return None;
-    }
+        // Other client errors (4xx except 404) = permanent failure
+        if status.is_client_error() {
+            warn!(file = %file_name, status = %status, "Client error, skipping");
+            return None;
+        }
 
-    // Get content-type from response, but override for known file types
-    // Archive.org sometimes returns wrong content-types
-    let content_type = mime_from_name(file_name)
-        .or_else(|| {
-            response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        });
+        // Server errors (5xx) = retry
+        if !status.is_success() {
+            warn!(file = %file_name, status = %status, attempt = attempt, "Server error, will retry");
+            continue;
+        }
 
-    // Acquire buffer slot
-    let mut slot = buffer_pool.acquire().await;
+        // Get content-type from response, but override for known file types
+        let content_type = mime_from_name(file_name)
+            .or_else(|| {
+                response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+            });
 
-    // Stream download into buffer
-    let download_start = std::time::Instant::now();
-    let mut stream = response.bytes_stream();
+        // Acquire buffer slot
+        let mut slot = buffer_pool.acquire().await;
 
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = match chunk_result {
-            Ok(c) => c,
+        // Stream download into buffer
+        let download_start = std::time::Instant::now();
+        let mut stream = response.bytes_stream();
+        let mut stream_error = false;
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(file = %file_name, error = %e, attempt = attempt, "Stream error, will retry");
+                    stream_error = true;
+                    break;
+                }
+            };
+            if let Err(e) = slot.write_chunk(&chunk) {
+                warn!(file = %file_name, error = %e, "Buffer write error, skipping");
+                return None;
+            }
+        }
+
+        if stream_error {
+            continue; // Retry the whole download
+        }
+
+        let size = slot.size();
+        let download_secs = download_start.elapsed().as_secs_f64();
+        let speed_mbps = if download_secs > 0.0 { (size as f64 / 1024.0 / 1024.0) / download_secs } else { 0.0 };
+
+        info!(
+            file = %file_name,
+            size_mb = size / 1024 / 1024,
+            speed_mbps = format!("{:.1}", speed_mbps),
+            storage = slot.storage_type(),
+            "Download complete"
+        );
+
+        // Upload to Archivist (also retries forever)
+        let bytes = match slot.into_bytes() {
+            Ok(b) => b,
             Err(e) => {
-                warn!(file = %file_name, error = %e, "Download error, skipping");
+                warn!(file = %file_name, error = %e, "Failed to read buffer, skipping");
                 return None;
             }
         };
-        if let Err(e) = slot.write_chunk(&chunk) {
-            warn!(file = %file_name, error = %e, "Buffer write error, skipping");
-            return None;
+
+        let upload_url = format!("{}/api/archivist/v1/data", archivist_url);
+
+        // Retry upload forever
+        let mut upload_attempt: u32 = 0;
+        loop {
+            if upload_attempt > 0 {
+                let delay_ms = std::cmp::min(
+                    RETRY_BASE_DELAY_MS * (1u64 << std::cmp::min(upload_attempt - 1, 10)),
+                    MAX_RETRY_DELAY_MS,
+                );
+                let delay = Duration::from_millis(delay_ms);
+                if upload_attempt % 5 == 0 {
+                    warn!(file = %file_name, attempt = upload_attempt, "Still retrying upload...");
+                }
+                tokio::time::sleep(delay).await;
+            }
+            upload_attempt += 1;
+
+            let mut request = client
+                .post(&upload_url)
+                .header("Content-Disposition", format!("attachment; filename=\"{}\"", dest_name))
+                .body(bytes.clone());
+
+            if let Some(ct) = &content_type {
+                request = request.header("Content-Type", ct);
+            }
+
+            if let Some(creds) = auth {
+                request = request
+                    .header("X-Pubkey", &creds.pubkey)
+                    .header("X-Timestamp", creds.timestamp.to_string())
+                    .header("X-Signature", &creds.signature);
+            }
+
+            let upload_response = match request.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    warn!(file = %file_name, error = %e, attempt = upload_attempt, "Upload error, will retry");
+                    continue;
+                }
+            };
+
+            let upload_status = upload_response.status();
+
+            if upload_status.is_server_error() {
+                warn!(file = %file_name, status = %upload_status, attempt = upload_attempt, "Upload server error, will retry");
+                continue;
+            }
+
+            if !upload_status.is_success() {
+                let error_body = upload_response.text().await.unwrap_or_default();
+                warn!(
+                    file = %file_name,
+                    status = %upload_status,
+                    error = %error_body,
+                    "Upload failed permanently, skipping"
+                );
+                return None;
+            }
+
+            let cid = match upload_response.text().await {
+                Ok(text) => text.trim().to_string(),
+                Err(e) => {
+                    warn!(file = %file_name, error = %e, attempt = upload_attempt, "Failed to read CID, will retry");
+                    continue;
+                }
+            };
+
+            info!(file = %file_name, cid = %cid, "Upload complete");
+            return Some((cid, size));
         }
     }
-
-    let size = slot.size();
-    let download_secs = download_start.elapsed().as_secs_f64();
-    let speed_mbps = if download_secs > 0.0 { (size as f64 / 1024.0 / 1024.0) / download_secs } else { 0.0 };
-
-    info!(
-        file = %file_name,
-        size_mb = size / 1024 / 1024,
-        speed_mbps = format!("{:.1}", speed_mbps),
-        storage = slot.storage_type(),
-        "Download complete"
-    );
-
-    // Upload to Archivist
-    let bytes = match slot.into_bytes() {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(file = %file_name, error = %e, "Failed to read buffer, skipping");
-            return None;
-        }
-    };
-
-    let upload_url = format!("{}/api/archivist/v1/data", archivist_url);
-
-    let mut request = client
-        .post(&upload_url)
-        .header("Content-Disposition", format!("attachment; filename=\"{}\"", dest_name))
-        .body(bytes);
-
-    if let Some(ct) = &content_type {
-        request = request.header("Content-Type", ct);
-    }
-
-    if let Some(creds) = auth {
-        request = request
-            .header("X-Pubkey", &creds.pubkey)
-            .header("X-Timestamp", creds.timestamp.to_string())
-            .header("X-Signature", &creds.signature);
-    }
-
-    let upload_response = match request.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            warn!(file = %file_name, error = %e, "Failed to upload, skipping");
-            return None;
-        }
-    };
-
-    if !upload_response.status().is_success() {
-        let status = upload_response.status();
-        let error_body = upload_response.text().await.unwrap_or_default();
-        warn!(
-            file = %file_name,
-            status = %status,
-            content_type = ?content_type,
-            error = %error_body,
-            "Upload failed, skipping"
-        );
-        return None;
-    }
-
-    let cid = match upload_response.text().await {
-        Ok(text) => text.trim().to_string(),
-        Err(e) => {
-            warn!(file = %file_name, error = %e, "Failed to read CID, skipping");
-            return None;
-        }
-    };
-
-    info!(file = %file_name, cid = %cid, "Upload complete");
-    Some((cid, size))
 }
+
 
 /// Execute an import from Archive.org to Archivist.
 ///
@@ -897,6 +988,7 @@ async fn upload_file(
 /// * `identifier` - Archive.org item identifier
 /// * `auth` - Optional authentication credentials for Archivist uploads
 /// * `buffer_pool` - Shared buffer pool for downloads
+/// * `rate_limiter` - Global rate limiter for Archive.org API requests
 /// * `on_progress` - Callback for progress updates (0.0-1.0, optional message)
 pub async fn execute_import<F>(
     client: &Client,
@@ -904,6 +996,7 @@ pub async fn execute_import<F>(
     identifier: &str,
     auth: Option<&AuthCredentials>,
     buffer_pool: &std::sync::Arc<BufferPool>,
+    rate_limiter: &ArchiveRateLimiter,
     mut on_progress: F,
 ) -> anyhow::Result<JobResult>
 where
@@ -986,6 +1079,7 @@ where
 
     // Process all files in parallel using buffer_unordered
     // The buffer pool's acquire() naturally throttles to max_concurrent
+    // The rate limiter ensures we're good citizens to Archive.org
     let results: Vec<_> = stream::iter(all_tasks)
         .map(|(original_name, dest_name, track_num, title, artist, duration, is_meta)| {
             let client = client.clone();
@@ -993,6 +1087,7 @@ where
             let identifier = identifier.to_string();
             let auth = auth.cloned();
             let buffer_pool = Arc::clone(buffer_pool);
+            let rate_limiter = Arc::clone(rate_limiter);
 
             async move {
                 let result = upload_file(
@@ -1003,6 +1098,7 @@ where
                     &dest_name,
                     auth.as_ref(),
                     &buffer_pool,
+                    &rate_limiter,
                 ).await;
 
                 (result, dest_name, original_name, track_num, title, artist, duration, is_meta)

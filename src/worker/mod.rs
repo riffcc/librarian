@@ -23,9 +23,22 @@ pub mod release;
 pub mod source;
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
+use governor::{Quota, RateLimiter, clock::SystemClock, state::{InMemoryState, direct::NotKeyed}, middleware::NoOpMiddleware};
+use std::num::NonZeroU32;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Type alias for Archive.org rate limiter (global, shared across all downloads)
+pub type ArchiveRateLimiter = Arc<RateLimiter<NotKeyed, InMemoryState, SystemClock, NoOpMiddleware<SystemTime>>>;
+
+/// Create a rate limiter for Archive.org API requests.
+/// Default: 2 requests per second (conservative, Archive.org has undocumented limits)
+pub fn create_archive_rate_limiter(requests_per_second: u32) -> ArchiveRateLimiter {
+    let quota = Quota::per_second(NonZeroU32::new(requests_per_second).unwrap_or(NonZeroU32::new(2).unwrap()));
+    Arc::new(RateLimiter::direct_with_clock(quota, &SystemClock::default()))
+}
 
 use crate::api::{ApiState, JobNotification};
 use crate::auth::Auth;
@@ -49,6 +62,10 @@ pub struct WorkerConfig {
 
     /// Buffer pool configuration.
     pub buffer: BufferPoolConfig,
+
+    /// Archive.org rate limit (requests per second).
+    /// Default: 2 (conservative to be good citizens)
+    pub archive_rate_limit: u32,
 }
 
 impl Default for WorkerConfig {
@@ -58,6 +75,7 @@ impl Default for WorkerConfig {
             lens_url: None,
             auth: None,
             buffer: BufferPoolConfig::default(),
+            archive_rate_limit: 2, // 2 requests/sec to Archive.org
         }
     }
 }
@@ -69,6 +87,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("lens_url", &self.lens_url)
             .field("auth", &self.auth.as_ref().map(|a| a.public_key()))
             .field("buffer", &self.buffer)
+            .field("archive_rate_limit", &self.archive_rate_limit)
             .finish()
     }
 }
@@ -86,13 +105,20 @@ pub struct JobWorker {
     config: WorkerConfig,
     /// Shared buffer pool for all downloads - controls global concurrency
     buffer_pool: Arc<BufferPool>,
+    /// Global rate limiter for Archive.org API requests
+    archive_rate_limiter: ArchiveRateLimiter,
 }
 
 impl JobWorker {
     /// Create a new job worker.
     pub fn new(state: Arc<ApiState>, config: WorkerConfig) -> Self {
         let buffer_pool = BufferPool::new(config.buffer.clone());
-        Self { state, config, buffer_pool }
+        let archive_rate_limiter = create_archive_rate_limiter(config.archive_rate_limit);
+        info!(
+            rate_limit = config.archive_rate_limit,
+            "Archive.org rate limiter initialized"
+        );
+        Self { state, config, buffer_pool, archive_rate_limiter }
     }
 
     /// Run the worker - waits on channel for job notifications.
@@ -214,6 +240,7 @@ impl JobWorker {
             &identifier,
             auth_creds.as_ref(),
             &self.buffer_pool,
+            &self.archive_rate_limiter,
             |progress, message| {
                 if let Some(msg) = message {
                     debug!(job_id = %job_id_hex, progress = %progress, message = %msg, "Import progress");
