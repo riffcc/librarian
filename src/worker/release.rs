@@ -11,7 +11,7 @@
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 
 use crate::auth::Auth;
 use crate::crdt::AudioQuality;
@@ -214,6 +214,225 @@ pub async fn create_release_in_lens(
     Ok(release.id)
 }
 
+/// Verify an existing release and update only what's different.
+///
+/// Compares metadata fields and only sends updates for mismatches.
+/// Returns Ok(true) if release was updated, Ok(false) if already correct.
+async fn verify_existing_release(
+    client: &Client,
+    lens_url: &str,
+    release_id: &str,
+    new_title: &str,
+    new_artist: Option<&str>,
+    new_thumbnail_cid: Option<&str>,
+    new_license_json: Option<&str>,
+    new_date: Option<&str>,
+    new_track_metadata: Option<&str>,
+    new_audio_quality: Option<&AudioQuality>,
+    new_quality_tiers: Option<&std::collections::HashMap<String, String>>,
+    auth: &Auth,
+) -> Result<bool, String> {
+    // First, fetch the existing release to compare
+    let fetch_url = format!("{}/api/v1/releases/{}", lens_url.trim_end_matches('/'), release_id);
+
+    let existing = match client.get(&fetch_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            resp.json::<serde_json::Value>().await.ok()
+        }
+        Ok(resp) => {
+            debug!(status = %resp.status(), "Failed to fetch existing release for comparison");
+            None
+        }
+        Err(e) => {
+            debug!(error = %e, "Failed to fetch existing release");
+            None
+        }
+    };
+
+    // Build what we want the metadata to look like
+    let mut desired_metadata = serde_json::Map::new();
+
+    if let Some(a) = new_artist {
+        desired_metadata.insert("author".to_string(), serde_json::Value::String(a.to_string()));
+    }
+    if let Some(license) = new_license_json {
+        desired_metadata.insert("license".to_string(), serde_json::Value::String(license.to_string()));
+    }
+    if let Some(date_str) = new_date {
+        desired_metadata.insert("releaseYear".to_string(), serde_json::Value::String(date_str.to_string()));
+    }
+    if let Some(tracks) = new_track_metadata {
+        desired_metadata.insert("trackMetadata".to_string(), serde_json::Value::String(tracks.to_string()));
+    }
+    if let Some(quality) = new_audio_quality {
+        if let Ok(v) = serde_json::to_value(quality) {
+            desired_metadata.insert("audioQuality".to_string(), v);
+        }
+    }
+    if let Some(tiers) = new_quality_tiers {
+        if let Ok(v) = serde_json::to_value(tiers) {
+            desired_metadata.insert("qualityLadder".to_string(), v);
+        }
+    }
+
+    // Compare with existing and build update payload with only differences
+    let mut updates = serde_json::Map::new();
+    let mut metadata_updates = serde_json::Map::new();
+
+    if let Some(ref existing) = existing {
+        let existing_meta = existing.get("metadata").and_then(|m| m.as_object());
+
+        // Check title
+        let existing_name = existing.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if existing_name != new_title {
+            debug!(old = %existing_name, new = %new_title, "Title differs");
+            updates.insert("name".to_string(), serde_json::Value::String(new_title.to_string()));
+        }
+
+        // Check thumbnail
+        let existing_thumb = existing.get("thumbnailCID").and_then(|v| v.as_str());
+        if new_thumbnail_cid != existing_thumb {
+            if let Some(thumb) = new_thumbnail_cid {
+                debug!(old = ?existing_thumb, new = %thumb, "Thumbnail differs");
+                updates.insert("thumbnailCID".to_string(), serde_json::Value::String(thumb.to_string()));
+            }
+        }
+
+        // Check each metadata field
+        for (key, new_value) in &desired_metadata {
+            let existing_value = existing_meta.and_then(|m| m.get(key));
+
+            let differs = match existing_value {
+                None => true, // Field missing
+                Some(existing) => existing != new_value,
+            };
+
+            if differs {
+                debug!(field = %key, "Metadata field differs or missing");
+                metadata_updates.insert(key.clone(), new_value.clone());
+            }
+        }
+
+        // Verify track count matches (integrity check)
+        if let Some(tracks_json) = new_track_metadata {
+            if let Ok(new_tracks) = serde_json::from_str::<Vec<serde_json::Value>>(tracks_json) {
+                let existing_track_count = existing_meta
+                    .and_then(|m| m.get("trackMetadata"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+                    .map(|t| t.len())
+                    .unwrap_or(0);
+
+                if existing_track_count != new_tracks.len() {
+                    info!(
+                        existing = existing_track_count,
+                        new = new_tracks.len(),
+                        "Track count mismatch - updating"
+                    );
+                }
+            }
+        }
+    } else {
+        // Couldn't fetch existing - update everything to be safe
+        warn!(release_id = %release_id, "Couldn't fetch existing release - updating all fields");
+        updates.insert("name".to_string(), serde_json::Value::String(new_title.to_string()));
+        if let Some(thumb) = new_thumbnail_cid {
+            updates.insert("thumbnailCID".to_string(), serde_json::Value::String(thumb.to_string()));
+        }
+        metadata_updates = desired_metadata.into_iter().collect();
+    }
+
+    // If nothing to update, we're done
+    if updates.is_empty() && metadata_updates.is_empty() {
+        info!(release_id = %release_id, "Release verified - no changes needed");
+        return Ok(false);
+    }
+
+    // Add metadata updates to payload
+    if !metadata_updates.is_empty() {
+        updates.insert("metadata".to_string(), serde_json::Value::Object(metadata_updates));
+    }
+
+    info!(
+        release_id = %release_id,
+        fields = ?updates.keys().collect::<Vec<_>>(),
+        "Updating release with changed fields"
+    );
+
+    // Send update
+    let url = format!("{}/api/v1/releases/{}", lens_url.trim_end_matches('/'), release_id);
+    let body = serde_json::to_string(&serde_json::Value::Object(updates)).map_err(|e| e.to_string())?;
+    let timestamp = Auth::timestamp_millis();
+    let message = format!("{}:{}", timestamp, body);
+    let signature = auth.sign(message.as_bytes());
+
+    let response = client
+        .put(&url)
+        .header("Content-Type", "application/json")
+        .header("X-Public-Key", auth.public_key())
+        .header("X-Timestamp", timestamp.to_string())
+        .header("X-Signature", &signature)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if response.status().is_success() {
+        info!(release_id = %release_id, "Successfully updated release");
+        Ok(true)
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(format!("HTTP {}: {}", status, body))
+    }
+}
+
+/// Check if a pending release with the same contentCID already exists.
+///
+/// Returns the existing release ID if found, None otherwise.
+async fn check_duplicate_pending_release(
+    client: &Client,
+    lens_url: &str,
+    content_cid: &str,
+) -> Option<String> {
+    let url = format!("{}/api/v1/releases/pending", lens_url.trim_end_matches('/'));
+
+    let response = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            debug!(error = %e, "Failed to fetch pending releases for duplicate check");
+            return None;
+        }
+    };
+
+    if !response.status().is_success() {
+        debug!(status = %response.status(), "Failed to fetch pending releases");
+        return None;
+    }
+
+    // Parse response as array of releases
+    let releases: Vec<serde_json::Value> = match response.json().await {
+        Ok(r) => r,
+        Err(e) => {
+            debug!(error = %e, "Failed to parse pending releases response");
+            return None;
+        }
+    };
+
+    // Check if any pending release has matching contentCID
+    for release in releases {
+        if let Some(cid) = release.get("contentCID").and_then(|v| v.as_str()) {
+            if cid == content_cid {
+                if let Some(id) = release.get("id").and_then(|v| v.as_str()) {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Try to create a release in Citadel Lens, logging but not failing on error.
 ///
 /// This is a best-effort operation - the import is still successful even if
@@ -259,6 +478,37 @@ pub async fn try_create_release(
             return None;
         }
     };
+
+    // Check for duplicate: does a pending release with this CID already exist?
+    if let Some(existing_id) = check_duplicate_pending_release(client, url, content_cid).await {
+        info!(
+            release_id = %existing_id,
+            content_cid = %content_cid,
+            "Release already exists in moderation queue - verifying"
+        );
+
+        // Verify the existing release - only update fields that differ
+        match verify_existing_release(
+            client,
+            url,
+            &existing_id,
+            title,
+            artist,
+            thumbnail_cid,
+            license_json,
+            date,
+            track_metadata,
+            audio_quality,
+            quality_tiers,
+            auth,
+        ).await {
+            Ok(true) => info!(release_id = %existing_id, "Release updated with new metadata"),
+            Ok(false) => info!(release_id = %existing_id, "Release verified - already up to date"),
+            Err(e) => warn!(error = %e, release_id = %existing_id, "Failed to verify release"),
+        }
+
+        return Some(existing_id);
+    }
 
     match create_release_in_lens(
         client,
