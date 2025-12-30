@@ -416,19 +416,32 @@ async fn check_duplicate_pending_release(
     source: &str,
     title: &str,
     artist: Option<&str>,
+    auth: &Auth,
 ) -> Option<String> {
     let url = format!("{}/api/v1/releases/pending", lens_url.trim_end_matches('/'));
 
-    let response = match client.get(&url).send().await {
+    // Pending releases endpoint requires authentication
+    let timestamp = Auth::timestamp_millis();
+    let message = format!("{}:", timestamp); // GET request, no body
+    let signature = auth.sign(message.as_bytes());
+
+    let response = match client
+        .get(&url)
+        .header("X-Public-Key", auth.public_key())
+        .header("X-Timestamp", timestamp.to_string())
+        .header("X-Signature", &signature)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
-            debug!(error = %e, "Failed to fetch pending releases for duplicate check");
+            warn!(error = %e, "Failed to fetch pending releases - duplicate check skipped!");
             return None;
         }
     };
 
     if !response.status().is_success() {
-        debug!(status = %response.status(), "Failed to fetch pending releases");
+        warn!(status = %response.status(), url = %url, "Failed to fetch pending releases - duplicate check skipped!");
         return None;
     }
 
@@ -553,7 +566,7 @@ pub async fn try_create_release(
 
     // Check for duplicate: does a pending release already exist?
     // Checks by contentCID, source (archive.org ID), or name+artist
-    if let Some(existing_id) = check_duplicate_pending_release(client, url, content_cid, source, title, artist).await {
+    if let Some(existing_id) = check_duplicate_pending_release(client, url, content_cid, source, title, artist, auth).await {
         info!(
             release_id = %existing_id,
             content_cid = %content_cid,
