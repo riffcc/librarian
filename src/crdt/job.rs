@@ -107,10 +107,14 @@ pub enum JobResult {
 
     /// Import completed.
     Import {
-        /// Number of audio files imported.
+        /// Number of audio files imported (per tier, total across all tiers).
         files_imported: usize,
-        /// Directory CID in Archivist.
+        /// Primary directory CID (highest quality tier available).
         directory_cid: String,
+        /// Quality tier CIDs for the Quality Ladder.
+        /// Map of tier name ("lossless", "mp3_high", "ogg", etc.) to directory CID.
+        #[serde(default)]
+        quality_tiers: std::collections::HashMap<String, String>,
         /// Source identifier (e.g., "archive.org:tou2016").
         source: String,
         /// Extracted album/release title.
@@ -122,6 +126,13 @@ pub enum JobResult {
         /// Structured license info as JSON string (matches Flagship's LicenseInfo format).
         /// Contains: type, version, jurisdiction, url
         license: Option<String>,
+        /// Track metadata as JSON string array (matches Flagship's trackMetadata format).
+        /// Contains: [{title, artist, duration, trackNumber}, ...]
+        #[serde(default)]
+        track_metadata: Option<String>,
+        /// Cover art CID (WebP format, 85% quality).
+        #[serde(default)]
+        thumbnail_cid: Option<String>,
     },
 
     /// Source import completed - URL/CID imported to Archivist.
