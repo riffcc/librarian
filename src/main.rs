@@ -247,8 +247,30 @@ async fn run_daemon(
 
     // "Nothing is ever really lost to us as long as we remember it."
     // — L.M. Montgomery
-    // Re-notify any pending jobs from previous session
+    // Recover jobs from previous session:
+    // 1. Reset stale Running jobs (daemon died while they were executing)
+    // 2. Re-notify all Pending jobs (including ones we just reset)
     {
+        // First, reset stale running jobs
+        let stale_jobs = {
+            let node = state.node.read().await;
+            node.my_stale_running_jobs().unwrap_or_default()
+        };
+
+        if !stale_jobs.is_empty() {
+            let mut node = state.node.write().await;
+            let mut reset_count = 0;
+            for job in &stale_jobs {
+                if node.reset_stale_job(&job.id).is_ok() {
+                    reset_count += 1;
+                }
+            }
+            if reset_count > 0 {
+                tracing::info!(count = reset_count, "Reset stale running jobs from previous session");
+            }
+        }
+
+        // Now recover all pending jobs (including the ones we just reset)
         let node = state.node.read().await;
         if let Ok(pending) = node.my_pending_jobs() {
             for job in &pending {

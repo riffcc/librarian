@@ -408,6 +408,38 @@ impl LibrarianNode {
             .collect())
     }
 
+    /// Get jobs that were Running on this node but are now stale (daemon restarted).
+    /// These need to be reset to Pending so they can be re-executed.
+    pub fn my_stale_running_jobs(&self) -> Result<Vec<Job>> {
+        let jobs = self.store.list::<Job>()?;
+        Ok(jobs
+            .into_iter()
+            .filter(|j| {
+                j.status == JobStatus::Running
+                    && j.should_execute(&self.node_id)
+            })
+            .collect())
+    }
+
+    /// Reset a stale running job back to Pending so it can be re-executed.
+    /// This increments retry_count to ensure the state wins in CRDT merge.
+    pub fn reset_stale_job(&mut self, job_id: &ContentId) -> Result<Option<Job>> {
+        let Some(mut job) = self.store.get::<Job>(job_id)? else {
+            return Ok(None);
+        };
+
+        if job.status == JobStatus::Running {
+            // Reset to pending - this increments retry_count for CRDT merge
+            job.retry_count += 1;
+            job.status = JobStatus::Pending;
+            // Keep claims - the same node should still be the executor
+            self.store.put(&job)?;
+            Ok(Some(job))
+        } else {
+            Ok(None)
+        }
+    }
+
     // === Gossip Operations ===
 
     /// Broadcast job progress.
