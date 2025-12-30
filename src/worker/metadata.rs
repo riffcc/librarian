@@ -69,6 +69,59 @@ impl From<PictureType> for CoverArtType {
     }
 }
 
+/// Extract audio quality information from file bytes.
+///
+/// Returns format, bitrate, sample rate, bit depth based on the audio codec.
+pub fn extract_audio_quality(bytes: &[u8], filename: &str) -> Option<crate::crdt::AudioQuality> {
+    let cursor = Cursor::new(bytes);
+
+    let tagged_file = match Probe::new(cursor).guess_file_type() {
+        Ok(probe) => match probe.read() {
+            Ok(file) => file,
+            Err(e) => {
+                warn!(filename = %filename, error = %e, "Failed to read audio file for quality");
+                return None;
+            }
+        },
+        Err(e) => {
+            warn!(filename = %filename, error = %e, "Failed to probe audio file type");
+            return None;
+        }
+    };
+
+    let properties = tagged_file.properties();
+
+    // Determine format from file type
+    let format = match tagged_file.file_type() {
+        lofty::file::FileType::Flac => "flac".to_string(),
+        lofty::file::FileType::Mpeg => "mp3".to_string(),
+        lofty::file::FileType::Opus => "opus".to_string(),
+        lofty::file::FileType::Vorbis => "vorbis".to_string(),
+        lofty::file::FileType::Aac => "aac".to_string(),
+        lofty::file::FileType::Wav => "wav".to_string(),
+        lofty::file::FileType::Aiff => "aiff".to_string(),
+        lofty::file::FileType::Ape => "ape".to_string(),
+        _ => "other".to_string(),
+    };
+
+    // Get bitrate (convert from bps to kbps)
+    let bitrate = properties.audio_bitrate();
+
+    // Get sample rate
+    let sample_rate = properties.sample_rate();
+
+    // Get bit depth (only meaningful for lossless)
+    let bit_depth = properties.bit_depth().map(|d| d as u32);
+
+    Some(crate::crdt::AudioQuality {
+        format,
+        bitrate,
+        sample_rate,
+        bit_depth,
+        codec: None, // Could be enhanced later
+    })
+}
+
 /// Extract metadata from audio file bytes.
 ///
 /// Reads ID3v2, Vorbis Comments, or FLAC metadata depending on file format.
@@ -275,13 +328,22 @@ pub fn determine_album_artist(tracks: &[TrackMetadata]) -> Option<String> {
 // Golden Format Functions
 // =============================================================================
 
-/// Characters that are unsafe in filenames across platforms.
-const UNSAFE_CHARS: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+/// Characters that are unsafe in UNIX filenames.
+///
+/// We only remove chars that are genuinely problematic on UNIX:
+/// - `/` - path separator, would create subdirectories
+/// - `\0` - null byte, terminates strings in C/POSIX APIs
+///
+/// We deliberately keep characters like `&`, `?`, `*`, etc. that work fine on UNIX.
+/// "04 - Cigarettes & Coffee.mp3" is cooler than "04 - Cigarettes _ Coffee.mp3"
+/// Windows users can get sanitized filenames at download time if needed.
+const UNSAFE_CHARS: &[char] = &['/', '\0'];
 
 /// Sanitize a string for use in filenames.
 ///
-/// Replaces unsafe filesystem characters with underscores.
-/// Preserves Unicode characters - only replaces dangerous ones.
+/// Replaces only genuinely dangerous UNIX filesystem characters with underscores.
+/// Keeps `&`, `?`, `*`, quotes, and other chars that work fine on UNIX.
+/// Preserves Unicode characters fully.
 pub fn sanitize_filename(s: &str) -> String {
     s.chars()
         .map(|c| {

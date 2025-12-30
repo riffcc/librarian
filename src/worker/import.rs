@@ -180,7 +180,9 @@ fn generate_track_filename(file: &ArchiveFileEntry, track_num: Option<u32>) -> S
         .unwrap_or_default();
 
     // Try to use track title first
-    if let Some(title) = &file.title {
+    if let Some(raw_title) = &file.title {
+        // Unescape Archive.org metadata (e.g., "\(" → "(")
+        let title = unescape_archive_metadata(raw_title);
         let track_prefix = track_num
             .map(|n| format!("{:02} - ", n))
             .unwrap_or_default();
@@ -1120,8 +1122,9 @@ where
         let track_num = parse_track_number(&file.track);
         let nice_name = generate_track_filename(file, track_num);
         let original_name = file.name.clone();
-        let title = file.title.clone();
-        let artist = file.artist.clone();
+        // Unescape Archive.org metadata (e.g., "\(" → "(")
+        let title = file.title.as_ref().map(|t| unescape_archive_metadata(t));
+        let artist = file.artist.as_ref().map(|a| unescape_archive_metadata(a));
         let duration = parse_duration(&file.length);
 
         Some((original_name, nice_name, track_num, title, artist, duration, false, Some(tier)))
@@ -1581,5 +1584,29 @@ mod tests {
         assert_eq!(extract_license_jurisdiction("http://creativecommons.org/licenses/by/3.0/de/"), Some("de".to_string()));
         assert_eq!(extract_license_jurisdiction("http://creativecommons.org/licenses/by/4.0/deed.uk"), Some("uk".to_string()));
         assert_eq!(extract_license_jurisdiction("http://creativecommons.org/licenses/by/4.0/"), None); // International
+    }
+
+    #[test]
+    fn test_unescape_archive_metadata() {
+        // Real-world case: Archive.org escapes parentheses
+        assert_eq!(
+            unescape_archive_metadata(r"Cry Over You \(original mix\)"),
+            "Cry Over You (original mix)"
+        );
+        // Multiple escapes
+        assert_eq!(
+            unescape_archive_metadata(r"Song \[Remix\] \(Extended\)"),
+            "Song [Remix] (Extended)"
+        );
+        // Quotes (use regular string with double escaping for Rust)
+        assert_eq!(
+            unescape_archive_metadata("He said \\\"hello\\\""),
+            "He said \"hello\""
+        );
+        // Already clean - no change
+        assert_eq!(
+            unescape_archive_metadata("Normal Title (No Escapes)"),
+            "Normal Title (No Escapes)"
+        );
     }
 }
