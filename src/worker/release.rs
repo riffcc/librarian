@@ -2,6 +2,11 @@
 //!
 //! After an import completes, creates a release in the configured
 //! Citadel Lens instance with the extracted metadata.
+//!
+//! Metadata format matches Flagship's expected schema:
+//! - `metadata.author` - artist name
+//! - `metadata.trackMetadata` - JSON array of track info
+//! - `thumbnailCID` - cover art CID (WebP)
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -18,13 +23,16 @@ struct CreateReleaseRequest {
     name: String,
     /// Category ID (defaults to "music" for Archive.org imports)
     category_id: String,
-    /// Creator/artist name
+    /// Creator/artist name (shown in endless view)
     #[serde(skip_serializing_if = "Option::is_none")]
     creator: Option<String>,
     /// Content CID from Archivist
     #[serde(rename = "contentCID")]
     content_cid: String,
-    /// Metadata including license, source, etc.
+    /// Thumbnail/cover art CID (WebP format)
+    #[serde(rename = "thumbnailCID", skip_serializing_if = "Option::is_none")]
+    thumbnail_cid: Option<String>,
+    /// Metadata including author, trackMetadata, license, source, etc.
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<serde_json::Value>,
     /// Status - "pending" for moderation queue
@@ -49,11 +57,13 @@ struct CreateReleaseError {
 /// * `client` - HTTP client
 /// * `lens_url` - Base URL of Citadel Lens API (e.g., "https://lens.riff.cc")
 /// * `title` - Release title
-/// * `artist` - Artist/creator name
+/// * `artist` - Artist name (stored in metadata.author)
 /// * `content_cid` - CID of the directory in Archivist
+/// * `thumbnail_cid` - Optional cover art CID (WebP)
 /// * `source` - Source identifier (e.g., "archive.org:tou2016")
 /// * `license_json` - Optional license info as JSON string
 /// * `date` - Optional release date
+/// * `track_metadata` - Optional track metadata as JSON string
 /// * `auth` - Authentication credentials for signing
 ///
 /// # Returns
@@ -64,9 +74,11 @@ pub async fn create_release_in_lens(
     title: &str,
     artist: Option<&str>,
     content_cid: &str,
+    thumbnail_cid: Option<&str>,
     source: &str,
     license_json: Option<&str>,
     date: Option<&str>,
+    track_metadata: Option<&str>,
     auth: &Auth,
 ) -> Result<String, String> {
     info!(
@@ -74,14 +86,25 @@ pub async fn create_release_in_lens(
         title = %title,
         artist = ?artist,
         cid = %content_cid,
+        thumbnail = ?thumbnail_cid,
         "Creating release in Citadel Lens"
     );
 
-    // Build metadata object
+    // Build metadata object matching Flagship's expected format
     let mut metadata = serde_json::json!({
         "source": source,
         "importType": "archive.org"
     });
+
+    // Add artist (music category standard field)
+    if let Some(a) = artist {
+        metadata["artist"] = serde_json::Value::String(a.to_string());
+    }
+
+    // Add track metadata as JSON string (Flagship expects stringified JSON array)
+    if let Some(tracks) = track_metadata {
+        metadata["trackMetadata"] = serde_json::Value::String(tracks.to_string());
+    }
 
     // Add Archive.org identifier
     if let Some(id) = source.strip_prefix("archive.org:") {
@@ -95,17 +118,18 @@ pub async fn create_release_in_lens(
         }
     }
 
-    // Add date if provided
+    // Add date as releaseYear if provided (store full precision)
     if let Some(d) = date {
-        metadata["date"] = serde_json::Value::String(d.to_string());
+        metadata["releaseYear"] = serde_json::Value::String(d.to_string());
     }
 
     // Build the request body
     let request_body = CreateReleaseRequest {
         name: title.to_string(),
         category_id: "music".to_string(), // Default for Archive.org imports
-        creator: artist.map(String::from),
+        creator: artist.map(String::from), // Artist shown in endless view
         content_cid: content_cid.to_string(),
+        thumbnail_cid: thumbnail_cid.map(String::from),
         status: "pending".to_string(), // Goes to moderation queue
         metadata: Some(metadata),
     };
@@ -178,9 +202,11 @@ pub async fn try_create_release(
     title: Option<&str>,
     artist: Option<&str>,
     content_cid: &str,
+    thumbnail_cid: Option<&str>,
     source: &str,
     license_json: Option<&str>,
     date: Option<&str>,
+    track_metadata: Option<&str>,
     auth: Option<&Auth>,
 ) -> Option<String> {
     // Check if Lens URL is configured
@@ -216,9 +242,11 @@ pub async fn try_create_release(
         title,
         artist,
         content_cid,
+        thumbnail_cid,
         source,
         license_json,
         date,
+        track_metadata,
         auth,
     ).await {
         Ok(id) => Some(id),
