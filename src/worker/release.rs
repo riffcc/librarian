@@ -222,6 +222,7 @@ async fn verify_existing_release(
     client: &Client,
     lens_url: &str,
     release_id: &str,
+    new_content_cid: &str,  // NEW: the correct contentCID from this import
     new_title: &str,
     new_artist: Option<&str>,
     new_thumbnail_cid: Option<&str>,
@@ -282,6 +283,18 @@ async fn verify_existing_release(
     if let Some(ref existing) = existing {
         let existing_meta = existing.get("metadata").and_then(|m| m.as_object());
 
+        // Check contentCID - THIS IS THE KEY CHECK
+        // If files were re-uploaded (e.g., with fixed deduplication), update the CID
+        let existing_cid = existing.get("contentCID").and_then(|v| v.as_str()).unwrap_or("");
+        if existing_cid != new_content_cid {
+            info!(
+                old_cid = %existing_cid,
+                new_cid = %new_content_cid,
+                "Content CID differs - files were re-uploaded, updating release"
+            );
+            updates.insert("contentCID".to_string(), serde_json::Value::String(new_content_cid.to_string()));
+        }
+
         // Check title
         let existing_name = existing.get("name").and_then(|v| v.as_str()).unwrap_or("");
         if existing_name != new_title {
@@ -335,6 +348,7 @@ async fn verify_existing_release(
     } else {
         // Couldn't fetch existing - update everything to be safe
         warn!(release_id = %release_id, "Couldn't fetch existing release - updating all fields");
+        updates.insert("contentCID".to_string(), serde_json::Value::String(new_content_cid.to_string()));
         updates.insert("name".to_string(), serde_json::Value::String(new_title.to_string()));
         if let Some(thumb) = new_thumbnail_cid {
             updates.insert("thumbnailCID".to_string(), serde_json::Value::String(thumb.to_string()));
@@ -387,13 +401,21 @@ async fn verify_existing_release(
     }
 }
 
-/// Check if a pending release with the same contentCID already exists.
+/// Check if a pending release already exists that matches our import.
+///
+/// Checks in priority order:
+/// 1. Same contentCID (exact match - same files)
+/// 2. Same source (e.g., "archive.org:tou247" - same origin, possibly different files)
+/// 3. Same name + artist (fallback for non-Archive.org sources)
 ///
 /// Returns the existing release ID if found, None otherwise.
 async fn check_duplicate_pending_release(
     client: &Client,
     lens_url: &str,
     content_cid: &str,
+    source: &str,
+    title: &str,
+    artist: Option<&str>,
 ) -> Option<String> {
     let url = format!("{}/api/v1/releases/pending", lens_url.trim_end_matches('/'));
 
@@ -419,13 +441,63 @@ async fn check_duplicate_pending_release(
         }
     };
 
-    // Check if any pending release has matching contentCID
-    for release in releases {
+    // Extract Archive.org identifier if this is an Archive.org source
+    let archive_org_id = source.strip_prefix("archive.org:");
+
+    // Check each release for matches
+    for release in &releases {
+        let release_id = match release.get("id").and_then(|v| v.as_str()) {
+            Some(id) => id,
+            None => continue,
+        };
+
+        // Priority 1: Same contentCID (exact file match)
         if let Some(cid) = release.get("contentCID").and_then(|v| v.as_str()) {
             if cid == content_cid {
-                if let Some(id) = release.get("id").and_then(|v| v.as_str()) {
-                    return Some(id.to_string());
+                debug!(release_id = %release_id, "Duplicate found by contentCID");
+                return Some(release_id.to_string());
+            }
+        }
+
+        // Priority 2: Same source (Archive.org identifier)
+        if let Some(metadata) = release.get("metadata").and_then(|m| m.as_object()) {
+            // Check metadata.source
+            if let Some(existing_source) = metadata.get("source").and_then(|v| v.as_str()) {
+                if existing_source == source {
+                    debug!(release_id = %release_id, source = %source, "Duplicate found by source");
+                    return Some(release_id.to_string());
                 }
+            }
+
+            // Check metadata.archiveOrgId
+            if let Some(archive_id) = archive_org_id {
+                if let Some(existing_archive_id) = metadata.get("archiveOrgId").and_then(|v| v.as_str()) {
+                    if existing_archive_id == archive_id {
+                        debug!(release_id = %release_id, archive_id = %archive_id, "Duplicate found by archiveOrgId");
+                        return Some(release_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Priority 3: Same name + artist (fallback for non-Archive.org)
+    // Only use this if we don't have an Archive.org source
+    if archive_org_id.is_none() {
+        for release in &releases {
+            let release_id = match release.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let release_name = release.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let release_artist = release.get("metadata")
+                .and_then(|m| m.get("author"))
+                .and_then(|v| v.as_str());
+
+            if release_name == title && release_artist == artist {
+                debug!(release_id = %release_id, title = %title, "Duplicate found by name+artist");
+                return Some(release_id.to_string());
             }
         }
     }
@@ -479,19 +551,22 @@ pub async fn try_create_release(
         }
     };
 
-    // Check for duplicate: does a pending release with this CID already exist?
-    if let Some(existing_id) = check_duplicate_pending_release(client, url, content_cid).await {
+    // Check for duplicate: does a pending release already exist?
+    // Checks by contentCID, source (archive.org ID), or name+artist
+    if let Some(existing_id) = check_duplicate_pending_release(client, url, content_cid, source, title, artist).await {
         info!(
             release_id = %existing_id,
             content_cid = %content_cid,
+            source = %source,
             "Release already exists in moderation queue - verifying"
         );
 
-        // Verify the existing release - only update fields that differ
+        // Verify the existing release - update fields that differ, including contentCID
         match verify_existing_release(
             client,
             url,
             &existing_id,
+            content_cid,  // NEW: pass the new contentCID to compare/update
             title,
             artist,
             thumbnail_cid,
@@ -502,7 +577,7 @@ pub async fn try_create_release(
             quality_tiers,
             auth,
         ).await {
-            Ok(true) => info!(release_id = %existing_id, "Release updated with new metadata"),
+            Ok(true) => info!(release_id = %existing_id, "Release updated with new metadata/files"),
             Ok(false) => info!(release_id = %existing_id, "Release verified - already up to date"),
             Err(e) => warn!(error = %e, release_id = %existing_id, "Failed to verify release"),
         }
