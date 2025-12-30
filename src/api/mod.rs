@@ -19,7 +19,6 @@ use citadel_crdt::ContentId;
 use tokio::sync::{mpsc, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::Level;
 
 use crate::node::LibrarianNode;
 

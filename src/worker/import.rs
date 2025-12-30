@@ -803,10 +803,17 @@ async fn upload_file(
         urlencoding::encode(file_name)
     );
 
+    // Acquire buffer slot FIRST - this is what actually limits concurrency
+    // The slot is held for the entire download+upload cycle
+    let mut slot = buffer_pool.acquire().await;
+
     // Retry loop - continues forever until success or 404
     let mut attempt: u32 = 0;
     loop {
         if attempt > 0 {
+            // Clear buffer for retry
+            slot.clear();
+
             // Exponential backoff with cap at MAX_RETRY_DELAY
             let delay_ms = std::cmp::min(
                 RETRY_BASE_DELAY_MS * (1u64 << std::cmp::min(attempt - 1, 10)),
@@ -906,8 +913,8 @@ async fn upload_file(
                     .map(|s| s.to_string())
             });
 
-        // Acquire buffer slot
-        let mut slot = buffer_pool.acquire().await;
+        // Clear buffer before streaming (in case of retry within same slot)
+        slot.clear();
 
         // Stream download into buffer
         let download_start = std::time::Instant::now();

@@ -351,6 +351,26 @@ impl BufferSlot {
             "temp file"
         }
     }
+
+    /// Clear the buffer for reuse (e.g., on retry).
+    ///
+    /// Releases any charged resources and resets the buffer to empty state.
+    pub fn clear(&mut self) {
+        // Release resources back to the pool
+        if self.memory_charged > 0 {
+            self.pool.release_memory(self.memory_charged);
+            self.memory_charged = 0;
+        }
+        if self.disk_charged > 0 {
+            self.pool.release_disk(self.disk_charged);
+            self.disk_charged = 0;
+        }
+
+        // Create fresh SpooledTempFile
+        self.inner = SpooledTempFile::new(self.pool.config.spill_threshold as usize);
+        self.size = 0;
+        self.in_memory = true;
+    }
 }
 
 impl Drop for BufferSlot {
